@@ -50,6 +50,16 @@ pub struct ServerConfig {
     pub mode: Mode,
     /// Largest request body accepted (images arrive base64-encoded).
     pub max_body: Size,
+    /// How long a client may take to send its request body.
+    pub body_timeout: Span,
+    /// How long a client may take to send its request headers.
+    pub header_timeout: Span,
+    /// Request bodies the gate holds at once (requests waiting or running
+    /// keep theirs, to resend after a pause). Past it, new requests are
+    /// refused with 503 until some finish; one request is always admitted.
+    pub max_held_bytes: Size,
+    /// Open client connections at once; further ones wait to be accepted.
+    pub max_connections: usize,
     /// How long running requests may finish after a shutdown signal.
     pub drain: Span,
     /// Request headers removed before forwarding. `x-conversation-id` makes
@@ -77,6 +87,10 @@ impl Default for ServerConfig {
             upstream: "http://127.0.0.1:8081".into(),
             mode: Mode::Enforce,
             max_body: Size(64 << 20),
+            body_timeout: Span::secs(120),
+            header_timeout: Span::secs(30),
+            max_held_bytes: Size(256 << 20),
+            max_connections: 1024,
             drain: Span::secs(30),
             strip_request_headers: vec!["x-conversation-id".into()],
             allow_slot_actions: false,

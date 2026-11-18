@@ -83,6 +83,21 @@ pub(super) fn refusal(rejection: &Rejection, retry_after: Duration) -> Response 
     response
 }
 
+/// The gate holds as many request bodies as it may: try again shortly.
+pub(super) fn busy(retry_after: Duration) -> Response {
+    let mut response = error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "server_error",
+        "the gate is holding as many requests as it may; retry shortly".into(),
+    );
+    let headers = response.headers_mut();
+    headers.insert("x-gate-rejected-reason", HeaderValue::from_static("busy"));
+    if let Ok(value) = HeaderValue::from_str(&retry_after.as_secs().max(1).to_string()) {
+        headers.insert(header::RETRY_AFTER, value);
+    }
+    response
+}
+
 /// An OpenAI-style error body, its code the HTTP status.
 pub(super) fn error(status: StatusCode, kind: &str, message: String) -> Response {
     error_with_code(status, kind, message, json!(status.as_u16()))

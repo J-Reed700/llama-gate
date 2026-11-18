@@ -63,6 +63,11 @@ pub struct WaitingStatus {
 }
 
 impl Scheduler {
+    /// The slot running (or preparing) `ticket`, if any.
+    pub fn slot_of(&self, ticket: TicketId) -> Option<SlotId> {
+        self.find_ticket(ticket)
+    }
+
     pub fn status(&self, now: Millis) -> Status {
         let backends = self
             .backends

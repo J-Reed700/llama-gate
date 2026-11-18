@@ -150,20 +150,19 @@ impl Engine {
                 })
             })
             .collect();
+        // Requests in flight per client, counted in one pass.
+        let mut in_flight: HashMap<&str, (usize, usize)> = HashMap::new();
+        for waiter in self.waiting.values() {
+            in_flight.entry(&waiter.client).or_default().0 += 1;
+        }
+        for runner in self.running.values() {
+            in_flight.entry(&runner.client).or_default().1 += 1;
+        }
         let clients: Vec<Value> = self
             .clients
             .iter()
             .map(|(name, stats)| {
-                let waiting = self
-                    .waiting
-                    .values()
-                    .filter(|waiter| &waiter.client == name)
-                    .count();
-                let running = self
-                    .running
-                    .values()
-                    .filter(|runner| &runner.client == name)
-                    .count();
+                let (waiting, running) = in_flight.get(&**name).copied().unwrap_or_default();
                 json!({
                     "name": name,
                     "service": stats.id.and_then(|id| self.scheduler.service(id)),

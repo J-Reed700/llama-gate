@@ -33,14 +33,14 @@ pub(super) async fn status(State(state): State<Arc<AppState>>, headers: HeaderMa
     if let Some(denied) = not_admin(&state, &headers) {
         return denied;
     }
-    match state.handle.status().await {
-        Some(status) => axum::Json(status).into_response(),
-        None => error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "server_error",
-            "the engine is not responding".into(),
-        ),
-    }
+    (
+        [
+            (header::CONTENT_TYPE, "application/json"),
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
+        state.handle.status(),
+    )
+        .into_response()
 }
 
 pub(super) async fn metrics(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
@@ -82,29 +82,36 @@ pub(super) async fn events(State(state): State<Arc<AppState>>, headers: HeaderMa
         return denied;
     }
     let receiver = state.handle.subscribe();
+    let vitals = state.handle.vitals.clone();
+    // Ends when the gate starts shutting down, so an open dashboard does not
+    // hold the shutdown for the whole drain period.
     let stream = futures_util::stream::unfold(
         (
             receiver,
             true,
             tokio::time::interval(Duration::from_secs(15)),
         ),
-        |(mut receiver, first, mut ping)| async move {
-            if first {
-                let hello = Bytes::from_static(b": connected\n\n");
-                return Some((Ok::<_, std::io::Error>(hello), (receiver, false, ping)));
-            }
-            loop {
-                tokio::select! {
-                    event = receiver.recv() => match event {
-                        Ok(event) => {
-                            let chunk = Bytes::from(format!("data: {event}\n\n"));
-                            return Some((Ok(chunk), (receiver, false, ping)));
+        move |(mut receiver, first, mut ping)| {
+            let vitals = vitals.clone();
+            async move {
+                if first {
+                    let hello = Bytes::from_static(b": connected\n\n");
+                    return Some((Ok::<_, std::io::Error>(hello), (receiver, false, ping)));
+                }
+                loop {
+                    tokio::select! {
+                        () = vitals.drained() => return None,
+                        event = receiver.recv() => match event {
+                            Ok(event) => {
+                                let chunk = Bytes::from(format!("data: {event}\n\n"));
+                                return Some((Ok(chunk), (receiver, false, ping)));
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+                        },
+                        _ = ping.tick() => {
+                            return Some((Ok(Bytes::from_static(b": ping\n\n")), (receiver, false, ping)));
                         }
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
-                    },
-                    _ = ping.tick() => {
-                        return Some((Ok(Bytes::from_static(b": ping\n\n")), (receiver, false, ping)));
                     }
                 }
             }

@@ -24,6 +24,7 @@ pub mod control;
 pub mod engine;
 pub mod http;
 pub mod launcher;
+pub mod listen;
 pub mod metrics;
 pub mod models;
 pub mod snapshots;
@@ -40,7 +41,6 @@ use gate_llama::{
     Capabilities, Dialects, Health, Measurer, MeasurerConfig, Server, Timeouts, TokenCache,
 };
 use std::future::Future;
-use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex, RwLock};
@@ -231,6 +231,7 @@ impl Gate {
             names,
             custom_identify,
             tickets: AtomicU64::new(0),
+            held: Arc::default(),
             source,
         });
         if !custom_identify {
@@ -275,7 +276,11 @@ impl Gate {
             mode = ?config.server.mode,
             "llama-gate listening"
         );
-        let app = http::router(state).into_make_service_with_connect_info::<SocketAddr>();
+        let app = http::router(state);
+        let limits = listen::Limits {
+            header_timeout: config.server.header_timeout.0,
+            max_connections: config.server.max_connections,
+        };
         let drain = config.server.drain.0;
         let (stopping, stopped) = tokio::sync::oneshot::channel::<()>();
         let vitals = handle.vitals.clone();
@@ -286,7 +291,7 @@ impl Gate {
             handle.shutdown().await;
             let _ = stopping.send(());
         };
-        let server = axum::serve(listener, app).with_graceful_shutdown(graceful);
+        let server = listen::serve(listener, app, limits, graceful);
         // Without its engine the gate can only refuse: better to stop and be
         // restarted than to answer 503 to everything while looking up. (An
         // engine that stops because the gate is shutting down is expected.)

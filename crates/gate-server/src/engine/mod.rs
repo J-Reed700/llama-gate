@@ -17,6 +17,7 @@ use crate::control::Control;
 use crate::metrics::{Metrics, Timing, labels};
 use crate::models::{Models, reported_names};
 use crate::snapshots::{Loaded, Persister, SnapshotStore, StartOver};
+use bytes::Bytes;
 use gate_core::{
     BackendId, Backfill, Class, ClassId, ClientId, Command, Demand, Event, EvictOutcome,
     EvictionOrder, EvictionPolicy, Fifo, Largest, Layout, LeastRecentlyUsed, Millis, ModelId,
@@ -143,7 +144,6 @@ enum Message {
     },
     SwapUnsupported(BackendId, String),
     Upstream(BackendId, Upstream),
-    Status(oneshot::Sender<Value>),
     Reconfigure(Arc<Config>, oneshot::Sender<Result<Vec<String>, String>>),
     Shutdown(oneshot::Sender<()>),
 }
@@ -166,6 +166,7 @@ pub struct Handle {
     pub metrics: Arc<Metrics>,
     pub clock: Clock,
     pub vitals: Arc<Vitals>,
+    status: watch::Receiver<Bytes>,
 }
 
 /// Whether the engine is alive: its loop beats at least every scheduling
@@ -177,6 +178,7 @@ pub struct Vitals {
     stopped: std::sync::atomic::AtomicBool,
     /// The gate began shutting down: it serves what it has, takes nothing new.
     draining: std::sync::atomic::AtomicBool,
+    drain_started: tokio::sync::Notify,
 }
 
 impl Vitals {
@@ -197,6 +199,18 @@ impl Vitals {
     pub fn drain(&self) {
         self.draining
             .store(true, std::sync::atomic::Ordering::Release);
+        self.drain_started.notify_waiters();
+    }
+
+    /// Resolves once the gate starts shutting down.
+    pub async fn drained(&self) {
+        loop {
+            let started = self.drain_started.notified();
+            if self.draining() {
+                return;
+            }
+            started.await;
+        }
     }
 
     pub fn draining(&self) -> bool {
@@ -244,13 +258,10 @@ impl Handle {
         receiver
     }
 
-    pub async fn status(&self) -> Option<Value> {
-        let (reply, answer) = oneshot::channel();
-        self.sender.send(Message::Status(reply)).ok()?;
-        tokio::time::timeout(Duration::from_secs(5), answer)
-            .await
-            .ok()?
-            .ok()
+    /// The latest status document, serialized. The engine publishes it a
+    /// few times a second; reading it never waits on the engine.
+    pub fn status(&self) -> Bytes {
+        self.status.borrow().clone()
     }
 
     /// Live events, one JSON object per message.
@@ -385,7 +396,13 @@ pub struct Engine {
     class_names: Vec<String>,
     started: Instant,
     vitals: Arc<Vitals>,
+    /// The status document, republished at most every [`STATUS_EVERY`].
+    status: watch::Sender<Bytes>,
+    status_at: Option<Instant>,
 }
+
+/// How fresh the published status is.
+const STATUS_EVERY: Duration = Duration::from_millis(100);
 
 impl Engine {
     pub fn new(
@@ -399,7 +416,9 @@ impl Engine {
         let metrics = Arc::new(Metrics::default());
         let clock = Clock(Instant::now());
         let vitals = Arc::new(Vitals::default());
+        let (status, status_receiver) = watch::channel(Bytes::from_static(b"{}"));
         let handle = Handle {
+            status: status_receiver,
             sender: sender.clone(),
             events: events.clone(),
             metrics: metrics.clone(),
@@ -443,6 +462,8 @@ impl Engine {
             .collect();
         let engine = Self {
             vitals,
+            status,
+            status_at: None,
             class_names: config.class_names(),
             config,
             scheduler,
@@ -493,6 +514,11 @@ impl Engine {
             }
             self.persist();
             self.publish();
+            if self.status_at.is_none_or(|at| at.elapsed() >= STATUS_EVERY) {
+                self.status_at = Some(Instant::now());
+                let document = serde_json::to_vec(&self.status()).unwrap_or_default();
+                self.status.send_replace(Bytes::from(document));
+            }
         }
     }
 
@@ -547,9 +573,6 @@ impl Engine {
                 }
             }
             Message::Upstream(backend, change) => self.upstream(backend, change),
-            Message::Status(reply) => {
-                let _ = reply.send(self.status());
-            }
             Message::Reconfigure(config, reply) => {
                 let _ = reply.send(self.reconfigure(config));
             }
@@ -624,16 +647,9 @@ impl Engine {
         self.feed(Event::Bounced { ticket, now });
     }
 
-    /// The backend a running ticket is on, as the status reports it.
+    /// The backend a running ticket is on.
     fn locate(&self, ticket: TicketId) -> Option<BackendId> {
-        let status = self.scheduler.status(self.clock.now());
-        status.backends.iter().find_map(|backend| {
-            backend
-                .slots
-                .iter()
-                .any(|slot| slot.ticket == Some(ticket))
-                .then_some(backend.backend)
-        })
+        self.scheduler.slot_of(ticket).map(|slot| slot.backend)
     }
 
     fn upstream(&mut self, backend: BackendId, change: Upstream) {

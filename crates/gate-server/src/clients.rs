@@ -90,6 +90,13 @@ impl Denied {
 pub trait Identify: Send + Sync + std::fmt::Debug {
     fn identify(&self, caller: &Caller<'_>) -> Result<Identity, Denied>;
 
+    /// Refuses a request from its headers alone, before its body is read
+    /// (a missing or unknown required key). [`Identify::identify`] still
+    /// decides once the body is in.
+    fn precheck(&self, _headers: &HeaderMap) -> Result<(), Denied> {
+        Ok(())
+    }
+
     /// Whether the request may use the gate's own endpoints (status, events,
     /// metrics, reload).
     fn is_admin(&self, _headers: &HeaderMap) -> bool {
@@ -335,6 +342,16 @@ impl Rules {
 }
 
 impl Identify for Rules {
+    fn precheck(&self, headers: &HeaderMap) -> Result<(), Denied> {
+        if self.required && self.key_for(headers).is_none() {
+            return Err(match presented_key(headers) {
+                Some(_) => Denied::UnknownKey,
+                None => Denied::MissingKey,
+            });
+        }
+        Ok(())
+    }
+
     fn identify(&self, caller: &Caller<'_>) -> Result<Identity, Denied> {
         let headers = caller.headers;
         let key = self.key_for(headers);

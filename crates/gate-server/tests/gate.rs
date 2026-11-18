@@ -109,6 +109,9 @@ async fn send(base: &str, path: &str, body: Value, headers: &[(&str, &str)]) -> 
 }
 
 async fn status_of(gate: &Gate) -> Value {
+    // The engine republishes its status every 100 ms (and on each tick):
+    // wait out one refresh so the document includes what just happened.
+    tokio::time::sleep(Duration::from_millis(250)).await;
     reqwest::get(format!("{}/gate/status", gate.url))
         .await
         .unwrap()
@@ -564,6 +567,8 @@ async fn keys_are_required_when_configured_and_the_gates_own_endpoints_need_an_a
         .await
         .unwrap();
     assert_eq!(unauthorized.status(), 401);
+    // One status refresh (100 ms) after the request it should show.
+    tokio::time::sleep(Duration::from_millis(250)).await;
     let status: Value = reqwest::Client::new()
         .get(format!("{}/gate/status", gate.url))
         .bearer_auth("sk-admin")
@@ -793,4 +798,118 @@ async fn a_plain_restart_is_noticed() {
         }
     }
     assert!(noticed, "{}", metrics_of(&gate).await);
+}
+
+/// An open live-events stream (a dashboard) does not hold up shutdown for
+/// the whole drain period: the stream ends when the gate starts draining.
+#[tokio::test]
+async fn an_open_dashboard_does_not_hold_up_shutdown() {
+    let fake = Fake::start(2_000, 1, None, Duration::from_millis(1)).await;
+    let mut gate = gate(&fake, |config| {
+        config.server.drain = Span(Duration::from_secs(20));
+    })
+    .await;
+    let events = reqwest::get(format!("{}/gate/events", gate.url))
+        .await
+        .unwrap();
+    assert_eq!(events.status(), 200);
+    let started = std::time::Instant::now();
+    let _ = gate.stop.take().unwrap().send(());
+    let task = std::mem::replace(&mut gate.task, tokio::spawn(async {}));
+    tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .expect("shut down well within the drain period")
+        .unwrap();
+    assert!(started.elapsed() < Duration::from_secs(5));
+    drop(events);
+}
+
+/// The address a test gate listens on, for raw TCP tests.
+fn address_of(gate: &Gate) -> String {
+    gate.url.trim_start_matches("http://").to_owned()
+}
+
+/// A client that sends its headers a byte at a time cannot hold a
+/// connection forever: past `server.header_timeout` the gate closes it.
+#[tokio::test]
+async fn a_client_trickling_its_headers_is_cut_off() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let fake = Fake::start(2_000, 1, None, Duration::from_millis(1)).await;
+    let gate = gate(&fake, |config| {
+        config.server.header_timeout = Span(Duration::from_millis(300));
+    })
+    .await;
+    let mut stream = tokio::net::TcpStream::connect(address_of(&gate))
+        .await
+        .unwrap();
+    stream
+        .write_all(b"GET /gate/health HTTP/1.1\r\nHost: x\r\n")
+        .await
+        .unwrap();
+    // ...and never the blank line that ends the headers.
+    let mut buffer = Vec::new();
+    let read = tokio::time::timeout(Duration::from_secs(3), stream.read_to_end(&mut buffer)).await;
+    assert!(read.is_ok(), "the gate closed the connection");
+}
+
+/// Without a required key, a request is refused from its headers: the gate
+/// does not wait for (or hold) a body it would refuse anyway.
+#[tokio::test]
+async fn an_unauthenticated_request_is_refused_before_its_body() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let fake = Fake::start(2_000, 1, None, Duration::from_millis(1)).await;
+    let mut config = quick(&fake.url);
+    config.auth.required = true;
+    config.auth.keys = vec![KeyConfig {
+        key: Secret::new("sk-app"),
+        client: "app".into(),
+        class: None,
+    }];
+    config.auth.admin_keys = vec![Secret::new("sk-admin")];
+    let gate = start(config, None, Some("sk-admin")).await;
+    let mut stream = tokio::net::TcpStream::connect(address_of(&gate))
+        .await
+        .unwrap();
+    // Promise ten megabytes, send none of them.
+    stream
+        .write_all(
+            b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: 10000000\r\n\r\n",
+        )
+        .await
+        .unwrap();
+    let mut answer = [0u8; 64];
+    let read = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut answer))
+        .await
+        .expect("answered without waiting for the body")
+        .unwrap();
+    assert!(
+        std::str::from_utf8(&answer[..read])
+            .unwrap()
+            .starts_with("HTTP/1.1 401"),
+        "{:?}",
+        String::from_utf8_lossy(&answer[..read])
+    );
+}
+
+/// Requests keep their bodies while they wait or run; past
+/// `server.max_held_bytes` new ones are refused (503, retry) until some end.
+#[tokio::test]
+async fn bodies_held_past_the_budget_are_refused_until_some_finish() {
+    let fake = Fake::start(4_000, 1, None, Duration::from_millis(20)).await;
+    let gate = gate(&fake, |config| {
+        config.server.max_held_bytes = gate_server::units::Size(2_000);
+    })
+    .await;
+    // The first holds about 1.5 kB while it generates for a while.
+    let first = tokio::spawn({
+        let url = gate.url.clone();
+        async move { post(&url, chat_body("first-", 200, 40, false)).await }
+    });
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let (status, body) = post(&gate.url, chat_body("second-", 200, 2, false)).await;
+    assert_eq!(status, 503, "{body}");
+    let (status, _) = first.await.unwrap();
+    assert_eq!(status, 200);
+    let (status, body) = post(&gate.url, chat_body("third-", 200, 2, false)).await;
+    assert_eq!(status, 200, "admitted once the first ended: {body}");
 }

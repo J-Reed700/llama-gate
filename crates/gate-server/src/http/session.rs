@@ -11,6 +11,7 @@ pub(super) async fn generate(
     dialect: Arc<dyn Dialect>,
     body: Value,
     size: usize,
+    held: Held,
     identity: Identity,
     model: ModelId,
     owns_key: bool,
@@ -115,6 +116,7 @@ pub(super) async fn generate(
         reply,
     });
     let session = Session {
+        _held: held,
         state,
         config,
         ticket,
@@ -176,6 +178,8 @@ pub(super) enum Attempt {
 
 /// A request from arrival to its end, across attempts.
 pub(super) struct Session {
+    /// Its body's share of the gate's budget, given back when it ends.
+    _held: Held,
     state: Arc<AppState>,
     config: Arc<Config>,
     ticket: TicketId,

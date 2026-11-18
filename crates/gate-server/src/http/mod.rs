@@ -58,6 +58,8 @@ pub struct AppState {
     /// The program supplied its own identification: reloads keep it.
     pub custom_identify: bool,
     pub tickets: AtomicU64,
+    /// Bytes of request bodies held by requests in the gate.
+    pub held: Arc<AtomicU64>,
     /// The configuration file, for reloads.
     pub source: Option<PathBuf>,
 }
@@ -125,14 +127,33 @@ async fn proxy(
 ) -> Response {
     let config = state.config();
     let (parts, body) = request.into_parts();
-    let max_body = config.server.max_body.0 as usize;
-    let Ok(bytes) = to_bytes(body, max_body).await else {
+    // A caller the gate will refuse anyway does not get to send a body.
+    if let Err(denied) = state.identify().precheck(&parts.headers) {
         return error(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "invalid_request_error",
-            format!("request body exceeds {}", config.server.max_body),
+            StatusCode::UNAUTHORIZED,
+            "authentication_error",
+            denied.message().into(),
         );
-    };
+    }
+    let max_body = config.server.max_body.0 as usize;
+    let bytes =
+        match tokio::time::timeout(config.server.body_timeout.0, to_bytes(body, max_body)).await {
+            Ok(Ok(bytes)) => bytes,
+            Ok(Err(_)) => {
+                return error(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "invalid_request_error",
+                    format!("request body exceeds {}", config.server.max_body),
+                );
+            }
+            Err(_) => {
+                return error(
+                    StatusCode::REQUEST_TIMEOUT,
+                    "invalid_request_error",
+                    "the request body did not arrive in time".into(),
+                );
+            }
+        };
     let mode = config.server.mode;
     if mode != Mode::Bypass
         && is_slot_action(&parts.method, parts.uri.path())
@@ -199,19 +220,56 @@ async fn proxy(
             "no models are configured".into(),
         );
     };
+    // From here the parsed body is all the request needs.
+    let size = bytes.len();
+    drop(bytes);
+    let Some(held) = Held::take(&state.held, size as u64, config.server.max_held_bytes.0) else {
+        return busy(config.queue.retry_after.0);
+    };
     generate(
-        state,
-        config,
-        parts,
-        peer,
-        dialect,
-        body,
-        bytes.len(),
-        identity,
-        model,
-        owns_key,
+        state, config, parts, peer, dialect, body, size, held, identity, model, owns_key,
     )
     .await
+}
+
+/// Bytes of request bodies held by requests in the gate (each keeps its
+/// body to resend after a pause), given back when the request ends.
+pub(super) struct Held {
+    counter: Arc<AtomicU64>,
+    size: u64,
+}
+
+impl Held {
+    /// Takes `size` from the budget, unless that would pass `limit` while
+    /// something else is held: one request is always admitted.
+    fn take(counter: &Arc<AtomicU64>, size: u64, limit: u64) -> Option<Self> {
+        let mut current = counter.load(Ordering::Acquire);
+        loop {
+            if current > 0 && current.saturating_add(size) > limit {
+                return None;
+            }
+            match counter.compare_exchange_weak(
+                current,
+                current + size,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    return Some(Self {
+                        counter: counter.clone(),
+                        size,
+                    });
+                }
+                Err(actual) => current = actual,
+            }
+        }
+    }
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(self.size, Ordering::AcqRel);
+    }
 }
 
 fn query_value(uri: &Uri, key: &str) -> Option<String> {
