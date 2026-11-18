@@ -448,6 +448,17 @@ async fn a_server_that_dies_bounces_its_requests_to_a_live_one() {
 
 #[tokio::test]
 async fn an_urgent_request_pauses_one_still_reading_its_prompt_and_both_complete() {
+    urgent_request_pauses_a_prefill(false).await;
+}
+
+/// The same, with the paused request streaming llama.cpp's prompt-progress
+/// events: progress is not output, so it stays pausable while it reads.
+#[tokio::test]
+async fn progress_events_leave_a_request_pausable() {
+    urgent_request_pauses_a_prefill(true).await;
+}
+
+async fn urgent_request_pauses_a_prefill(progress: bool) {
     let fake = Fake::start(2_000, 2, None, Duration::from_millis(5)).await;
     fake.set_prefill(Duration::from_millis(800));
     let gate = gate(&fake, |config| {
@@ -471,6 +482,9 @@ async fn an_urgent_request_pauses_one_still_reading_its_prompt_and_both_complete
     .await;
     let mut agent = chat_body("agent-", 1_200, 20, true);
     agent["max_tokens"] = json!(300);
+    if progress {
+        agent["return_progress"] = json!(true);
+    }
     let agent = tokio::spawn({
         let url = gate.url.clone();
         async move {
@@ -671,5 +685,66 @@ async fn requests_go_to_the_server_of_the_model_they_name() {
         alpha.state.completions.load(Ordering::SeqCst),
         1,
         "unknown names go to the default (first) model"
+    );
+}
+
+/// Time to first token ends at the first output, not at the first event:
+/// llama.cpp's progress events arrive from the moment prefill starts.
+#[tokio::test]
+async fn time_to_first_token_waits_for_output_not_progress() {
+    let fake = Fake::start(2_000, 2, None, Duration::from_millis(5)).await;
+    fake.set_prefill(Duration::from_millis(600));
+    let gate = gate(&fake, |_| {}).await;
+    let mut body = chat_body("progress-", 300, 4, true);
+    body["return_progress"] = json!(true);
+    let text = reqwest::Client::new()
+        .post(format!("{}/v1/chat/completions", gate.url))
+        .json(&body)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert_eq!(
+        text.matches("prompt_progress").count(),
+        4,
+        "progress is relayed: {text}"
+    );
+    assert_eq!(text.matches("\"t \"").count(), 4, "{text}");
+    let status = status_of(&gate).await;
+    let report = &status["recent"][0];
+    let ttft = report["ttft_ms"].as_u64().expect("a time to first token");
+    assert!(
+        ttft >= 550,
+        "measured to the first token, not the first progress event: {report}"
+    );
+    assert_eq!(report["outcome"], "ok");
+}
+
+/// A server that reports an error mid-stream (as llama.cpp does, inside a
+/// 200 response) has not served the request: the client gets the error and
+/// the gate records a failure, not a success.
+#[tokio::test]
+async fn an_error_reported_mid_stream_is_recorded_as_a_failure() {
+    let fake = Fake::start(2_000, 1, None, Duration::from_millis(1)).await;
+    let gate = gate(&fake, |_| {}).await;
+    let mut body = chat_body("crash-", 100, 10, true);
+    body["messages"][0]["content"] = json!("hello gen:10 fail:2");
+    let text = reqwest::Client::new()
+        .post(format!("{}/v1/chat/completions", gate.url))
+        .json(&body)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(text.contains("the model crashed"), "{text}");
+    let status = status_of(&gate).await;
+    assert_eq!(
+        status["recent"][0]["outcome"], "error",
+        "{}",
+        status["recent"][0]
     );
 }

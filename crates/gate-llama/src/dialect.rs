@@ -4,6 +4,7 @@
 //! limit, and where the server's own options (`id_slot`, `cache_prompt`) go;
 //! it never talks to the server. Register a new implementation in
 //! [`Dialects`] to put another endpoint under the gate.
+use crate::stream::Wire;
 use serde_json::{Map, Value, json};
 use std::sync::Arc;
 
@@ -44,19 +45,34 @@ pub trait Dialect: Send + Sync + std::fmt::Debug {
         true
     }
 
-    /// The generation limit the client asked for, if any.
+    /// The generation limit the server will apply, as it resolves the
+    /// request's fields; `None` when there is none (absent, or negative,
+    /// which llama.cpp reads as "until the context is full").
     fn requested_generation(&self, body: &Value) -> Option<u64>;
 
-    /// Sets the generation limit in this dialect's own field.
+    /// Caps generation at `tokens`, in the field the server reads first, so
+    /// no other field the client set can lift it.
     fn limit_generation(&self, body: &mut Value, tokens: u64);
 
-    /// Completions requested at once (OpenAI `n`).
+    /// Completions requested at once. llama.cpp reads `n_cmpl` before
+    /// OpenAI's `n` and runs the extra ones in other free slots.
     fn choices(&self, body: &Value) -> u64 {
-        body.get("n").and_then(Value::as_u64).unwrap_or(1).max(1)
+        ["n_cmpl", "n"]
+            .iter()
+            .find_map(|key| body.get(*key).and_then(Value::as_u64))
+            .unwrap_or(1)
+            .max(1)
     }
 
     fn streaming(&self, body: &Value) -> bool {
         body.get("stream").and_then(Value::as_bool).unwrap_or(false)
+    }
+
+    /// How its responses are shaped: what counts as output in its stream,
+    /// and where its token counts are. A dialect that does not say is read
+    /// conservatively (any event is output).
+    fn wire(&self) -> Wire {
+        Wire::Opaque
     }
 
     /// Whether the server runs the request in the slot named by `id_slot`.
@@ -127,11 +143,51 @@ impl Dialects {
     }
 }
 
-fn number(body: &Value, key: &str) -> Option<u64> {
-    body.get(key)
-        .and_then(Value::as_i64)
-        .filter(|value| *value > 0)
-        .map(|value| value as u64)
+/// The fields llama.cpp reads a generation limit from, first present wins
+/// (`server-schema.cpp`): every completion endpoint shares them.
+const LIMIT_FIELDS: [&str; 3] = ["n_predict", "max_completion_tokens", "max_tokens"];
+
+/// The limit set by the first of `fields` present in `object`: `Some(None)`
+/// for a negative value (no limit), `None` when none is present.
+fn first_limit(object: &Value, fields: &[&str]) -> Option<Option<u64>> {
+    fields.iter().find_map(|key| {
+        let value = object.get(*key)?;
+        let limit = value.as_i64()?;
+        Some(u64::try_from(limit).ok())
+    })
+}
+
+/// A completion endpoint's limit, as the server resolves it.
+fn completion_limit(body: &Value) -> Option<u64> {
+    first_limit(body, &LIMIT_FIELDS).flatten()
+}
+
+/// Sets the limit no other field can override: `n_predict` is read first.
+fn set_completion_limit(body: &mut Value, tokens: u64) {
+    if let Some(object) = body.as_object_mut() {
+        object.insert("n_predict".into(), json!(tokens));
+    }
+}
+
+/// The limit of an API llama.cpp converts to a chat completion (Responses,
+/// Anthropic): its own field is converted first and `extra_params` are
+/// merged over the result, so theirs win (`server-chat.cpp`).
+fn converted_limit(body: &Value, own: &str) -> Option<u64> {
+    body.get("extra_params")
+        .and_then(|extra| first_limit(extra, &LIMIT_FIELDS))
+        .or_else(|| first_limit(body, &[own]))
+        .flatten()
+}
+
+fn set_converted_limit(body: &mut Value, tokens: u64) {
+    let Some(object) = body.as_object_mut() else {
+        return;
+    };
+    let extra = object.entry("extra_params").or_insert_with(|| json!({}));
+    if !extra.is_object() {
+        *extra = json!({});
+    }
+    set_completion_limit(extra, tokens);
 }
 
 fn tokens_of(value: &Value) -> Option<Vec<i32>> {
@@ -208,6 +264,10 @@ impl Dialect for OpenAiChat {
         "openai_chat"
     }
 
+    fn wire(&self) -> Wire {
+        Wire::OpenAiChat
+    }
+
     fn paths(&self) -> &'static [&'static str] {
         &["/v1/chat/completions", "/chat/completions"]
     }
@@ -221,16 +281,11 @@ impl Dialect for OpenAiChat {
     }
 
     fn requested_generation(&self, body: &Value) -> Option<u64> {
-        number(body, "max_completion_tokens").or_else(|| number(body, "max_tokens"))
+        completion_limit(body)
     }
 
     fn limit_generation(&self, body: &mut Value, tokens: u64) {
-        let key = if body.get("max_completion_tokens").is_some() {
-            "max_completion_tokens"
-        } else {
-            "max_tokens"
-        };
-        body[key] = json!(tokens);
+        set_completion_limit(body, tokens);
     }
 }
 
@@ -243,8 +298,12 @@ impl Dialect for OpenAiCompletions {
         "openai_completions"
     }
 
+    fn wire(&self) -> Wire {
+        Wire::OpenAiCompletion
+    }
+
     fn paths(&self) -> &'static [&'static str] {
-        &["/v1/completions", "/completions"]
+        &["/v1/completions"]
     }
 
     fn prompt(&self, body: &Value) -> Prompt {
@@ -252,11 +311,11 @@ impl Dialect for OpenAiCompletions {
     }
 
     fn requested_generation(&self, body: &Value) -> Option<u64> {
-        number(body, "max_tokens")
+        completion_limit(body)
     }
 
     fn limit_generation(&self, body: &mut Value, tokens: u64) {
-        body["max_tokens"] = json!(tokens);
+        set_completion_limit(body, tokens);
     }
 }
 
@@ -344,6 +403,10 @@ impl Dialect for OpenAiResponses {
         "openai_responses"
     }
 
+    fn wire(&self) -> Wire {
+        Wire::Responses
+    }
+
     fn paths(&self) -> &'static [&'static str] {
         &["/v1/responses", "/responses"]
     }
@@ -364,11 +427,11 @@ impl Dialect for OpenAiResponses {
     }
 
     fn requested_generation(&self, body: &Value) -> Option<u64> {
-        number(body, "max_output_tokens")
+        converted_limit(body, "max_output_tokens")
     }
 
     fn limit_generation(&self, body: &mut Value, tokens: u64) {
-        body["max_output_tokens"] = json!(tokens);
+        set_converted_limit(body, tokens);
     }
 
     fn choices(&self, _body: &Value) -> u64 {
@@ -396,8 +459,12 @@ impl Dialect for NativeCompletion {
         "llama_completion"
     }
 
+    fn wire(&self) -> Wire {
+        Wire::Llama
+    }
+
     fn paths(&self) -> &'static [&'static str] {
-        &["/completion"]
+        &["/completion", "/completions"]
     }
 
     fn prompt(&self, body: &Value) -> Prompt {
@@ -412,11 +479,11 @@ impl Dialect for NativeCompletion {
     }
 
     fn requested_generation(&self, body: &Value) -> Option<u64> {
-        number(body, "n_predict").or_else(|| number(body, "max_tokens"))
+        completion_limit(body)
     }
 
     fn limit_generation(&self, body: &mut Value, tokens: u64) {
-        body["n_predict"] = json!(tokens);
+        set_completion_limit(body, tokens);
     }
 }
 
@@ -427,6 +494,10 @@ pub struct Infill;
 impl Dialect for Infill {
     fn name(&self) -> &'static str {
         "llama_infill"
+    }
+
+    fn wire(&self) -> Wire {
+        Wire::Llama
     }
 
     fn paths(&self) -> &'static [&'static str] {
@@ -454,11 +525,11 @@ impl Dialect for Infill {
     }
 
     fn requested_generation(&self, body: &Value) -> Option<u64> {
-        number(body, "n_predict")
+        completion_limit(body)
     }
 
     fn limit_generation(&self, body: &mut Value, tokens: u64) {
-        body["n_predict"] = json!(tokens);
+        set_completion_limit(body, tokens);
     }
 }
 
@@ -527,6 +598,10 @@ impl Dialect for AnthropicMessages {
         "anthropic_messages"
     }
 
+    fn wire(&self) -> Wire {
+        Wire::Anthropic
+    }
+
     fn paths(&self) -> &'static [&'static str] {
         &["/v1/messages"]
     }
@@ -554,11 +629,11 @@ impl Dialect for AnthropicMessages {
     }
 
     fn requested_generation(&self, body: &Value) -> Option<u64> {
-        number(body, "max_tokens")
+        converted_limit(body, "max_tokens")
     }
 
     fn limit_generation(&self, body: &mut Value, tokens: u64) {
-        body["max_tokens"] = json!(tokens);
+        set_converted_limit(body, tokens);
     }
 
     fn choices(&self, _body: &Value) -> u64 {
@@ -736,26 +811,77 @@ mod tests {
     }
 
     #[test]
-    fn generation_limits_are_read_and_written_in_each_dialects_field() {
-        let mut chat = json!({"messages": [], "max_completion_tokens": 900});
+    fn generation_limits_resolve_as_the_server_resolves_them() {
+        // The first of n_predict, max_completion_tokens, max_tokens wins.
+        let chat = json!({"messages": [], "max_completion_tokens": 900, "max_tokens": 50});
         assert_eq!(OpenAiChat.requested_generation(&chat), Some(900));
+        let chat = json!({"messages": [], "n_predict": 70, "max_tokens": 900});
+        assert_eq!(OpenAiChat.requested_generation(&chat), Some(70));
+        // Negative is no limit at all, even beside a smaller field.
+        let unbounded = json!({"messages": [], "n_predict": -1, "max_tokens": 900});
+        assert_eq!(OpenAiChat.requested_generation(&unbounded), None);
+        // Zero is a limit (evaluate the prompt only), not "unset".
+        let prefill = json!({"messages": [], "max_tokens": 0});
+        assert_eq!(OpenAiChat.requested_generation(&prefill), Some(0));
+        // Infill shares the fields.
+        let infill = json!({"input_prefix": "fn ", "max_tokens": 128});
+        assert_eq!(Infill.requested_generation(&infill), Some(128));
+        // Converted APIs: extra_params are merged last and win.
+        let responses = json!({"input": "hi", "max_output_tokens": 300,
+                               "extra_params": {"max_tokens": 4000}});
+        assert_eq!(OpenAiResponses.requested_generation(&responses), Some(4000));
+        let anthropic = json!({"messages": [], "max_tokens": 128,
+                               "extra_params": {"n_predict": -1}});
+        assert_eq!(AnthropicMessages.requested_generation(&anthropic), None);
+    }
+
+    #[test]
+    fn a_written_limit_cannot_be_lifted_by_another_field() {
+        let mut chat = json!({"messages": [], "n_predict": -1, "max_tokens": 900});
         OpenAiChat.limit_generation(&mut chat, 500);
-        assert_eq!(chat["max_completion_tokens"], 500);
-        assert!(chat.get("max_tokens").is_none());
+        assert_eq!(OpenAiChat.requested_generation(&chat), Some(500));
+        for dialect in [
+            &OpenAiCompletions as &dyn Dialect,
+            &NativeCompletion,
+            &Infill,
+        ] {
+            let mut body = json!({"prompt": "hi", "max_tokens": 9000});
+            dialect.limit_generation(&mut body, 64);
+            assert_eq!(
+                dialect.requested_generation(&body),
+                Some(64),
+                "{}",
+                dialect.name()
+            );
+        }
+        for dialect in [&OpenAiResponses as &dyn Dialect, &AnthropicMessages] {
+            let mut body = json!({"messages": [], "input": "hi", "max_tokens": 9000,
+                                  "max_output_tokens": 9000,
+                                  "extra_params": {"max_tokens": 8000, "id_slot": 1}});
+            dialect.limit_generation(&mut body, 64);
+            assert_eq!(
+                dialect.requested_generation(&body),
+                Some(64),
+                "{}",
+                dialect.name()
+            );
+            assert_eq!(body["extra_params"]["id_slot"], 1, "other options survive");
+        }
+    }
 
-        let mut native = json!({"prompt": "hi", "n_predict": -1});
-        assert_eq!(
-            NativeCompletion.requested_generation(&native),
-            None,
-            "-1 means unlimited"
-        );
-        NativeCompletion.limit_generation(&mut native, 64);
-        assert_eq!(native["n_predict"], 64);
+    #[test]
+    fn several_completions_are_counted_as_the_server_counts_them() {
+        assert_eq!(OpenAiChat.choices(&json!({"n": 2})), 2);
+        assert_eq!(OpenAiChat.choices(&json!({"n": 1, "n_cmpl": 3})), 3);
+        assert_eq!(NativeCompletion.choices(&json!({})), 1);
+    }
 
-        let mut responses = json!({"input": "hi", "max_output_tokens": 300});
-        assert_eq!(OpenAiResponses.requested_generation(&responses), Some(300));
-        OpenAiResponses.limit_generation(&mut responses, 200);
-        assert_eq!(responses["max_output_tokens"], 200);
+    #[test]
+    fn bare_completions_is_llama_cpps_native_endpoint() {
+        let dialects = Dialects::standard();
+        let name = |path: &str| dialects.find(path).map(|dialect| dialect.name());
+        assert_eq!(name("/completions"), Some("llama_completion"));
+        assert_eq!(name("/v1/completions"), Some("openai_completions"));
     }
 
     #[test]

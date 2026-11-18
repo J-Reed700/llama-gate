@@ -355,6 +355,7 @@ name = "gate-llama"
 version = "0.2.0"
 dependencies = [
  "axum",
+ "bytes",
  "gate-core",
  "reqwest",
  "serde",

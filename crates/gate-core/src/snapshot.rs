@@ -52,6 +52,11 @@ impl SnapshotIndex {
         self.entries.remove(&id)
     }
 
+    /// Never allocates `id` or any id below it: a file by that name exists.
+    pub fn skip_past(&mut self, id: SnapshotId) {
+        self.next_id = self.next_id.max(id.0);
+    }
+
     /// Marks a snapshot as just used.
     pub fn touch(&mut self, id: SnapshotId) {
         self.clock += 1;

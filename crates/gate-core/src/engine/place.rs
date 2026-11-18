@@ -284,7 +284,10 @@ impl Scheduler {
             snapshot,
         } = site;
         let policy = &self.config.eviction;
-        let need = demand.prompt + generation;
+        // The learned margin pads a request only up to what the pool holds: a
+        // request that needs all of it runs alone either way.
+        let need = (demand.prompt + generation + backend.overrun)
+            .min(limit.max(demand.prompt + generation));
         let partial = policy.partial && backend.partial;
         // Where the server picks the slot itself, only an otherwise empty
         // unified pool can hold the request wherever it lands.
@@ -445,9 +448,9 @@ impl Scheduler {
 
     /// The class of a running request that more urgent work may pause: its
     /// class allows it, it has produced no output, it has not been paused
-    /// `max_preemptions` times, and the gate chose its slot (an unpinned
-    /// request's cells may be in any slot, so stopping it could not free a
-    /// known one).
+    /// `max_preemptions` times, and it runs in the one slot the gate chose (an
+    /// unpinned request's cells may be in any slot, and several answers at once
+    /// fill several, so stopping it could not free a known one).
     pub(super) fn pausable(&self, running: &Running) -> Option<&Class> {
         let class = self
             .config
@@ -455,6 +458,7 @@ impl Scheduler {
             .get(usize::from(running.waiting.demand.class.0))?;
         (class.preemptible
             && running.waiting.demand.pinned
+            && !running.waiting.demand.exclusive
             && !running.started
             && running.waiting.bumped < self.config.max_preemptions)
             .then_some(class)
@@ -481,7 +485,9 @@ impl Scheduler {
             if !backend.serves(demand.model) || floor > limit || backend.pool.any_freeing() {
                 continue;
             }
-            let need = demand.prompt + demand.generation.min(limit - demand.prompt);
+            let need =
+                (demand.prompt + demand.generation.min(limit - demand.prompt) + backend.overrun)
+                    .min(limit);
             let slot_id = |index| SlotId::new(backend_index as u16, index);
             // Lowest priority first, then the most recently started.
             let mut victims: Vec<(i32, Millis, usize, Tokens)> = backend

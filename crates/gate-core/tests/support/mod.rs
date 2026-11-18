@@ -350,6 +350,24 @@ impl Harness {
         });
     }
 
+    /// The request ran in several slots at once (`n` > 1, a prompt list) and
+    /// finished: each of `slots` holds a copy of its context.
+    pub fn finish_spread(&mut self, ticket: TicketId, generated: Tokens, slots: &[usize]) {
+        let run = self.running.remove(&ticket).expect("ticket is running");
+        let resident = run.prompt + generated;
+        for &index in slots {
+            self.physical[usize::from(run.slot.backend.0)][index] = resident;
+        }
+        let cached = self.cached;
+        self.feed(Event::Finished {
+            ticket,
+            resident: Some(resident),
+            generated: Some(generated),
+            cached,
+            now: self.now,
+        });
+    }
+
     /// The request's output began reaching its client.
     pub fn start(&mut self, ticket: TicketId) {
         if let Some(run) = self.running.get_mut(&ticket) {
@@ -376,6 +394,7 @@ impl Harness {
         self.pending
             .retain(|command| !matches!(command, Command::Dispatch { ticket: pending, .. } if *pending == ticket));
         self.feed(Event::Withdrawn {
+            relayed: Some(0),
             ticket,
             now: self.now,
         });

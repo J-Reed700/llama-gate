@@ -21,10 +21,12 @@ pub struct Usage {
 }
 
 impl Usage {
-    /// Generation speed as the server measured it.
+    /// Generation speed as the server measured it. llama.cpp starts its
+    /// generation clock at the first token, so its time covers the intervals
+    /// between tokens: one fewer than the tokens (and none for one token).
     pub fn tokens_per_second(&self) -> Option<f64> {
         let (generated, millis) = (self.generated?, self.decode_ms?);
-        (generated > 0 && millis > 0.0).then(|| generated as f64 * 1000.0 / millis)
+        (generated > 1 && millis > 0.0).then(|| (generated - 1) as f64 * 1000.0 / millis)
     }
 }
 
@@ -189,7 +191,7 @@ mod tests {
             }
         );
         assert_eq!(usage.resident(0), Some(1042));
-        assert_eq!(usage.tokens_per_second(), Some(70.0));
+        assert_eq!(usage.tokens_per_second(), Some(41.0 * 1000.0 / 600.0));
     }
 
     #[test]

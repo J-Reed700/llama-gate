@@ -21,19 +21,20 @@
 pub mod clients;
 pub mod config;
 pub mod control;
+pub mod engine;
+pub mod http;
 pub mod launcher;
 pub mod metrics;
 pub mod models;
-pub mod proxy;
-pub mod runtime;
 pub mod snapshots;
 pub mod units;
 
 use crate::clients::{Identify, Names, Rules};
-use crate::config::Config;
+use crate::config::{BackendConfig, Config, EvictionMode};
+use crate::engine::{BackendLink, Engine, Policies, watch_upstream};
+use crate::http::AppState;
 use crate::models::Models;
-use crate::proxy::AppState;
-use crate::runtime::{BackendLink, Engine, Policies, watch_upstream};
+use crate::snapshots::SnapshotStore;
 use gate_core::{BackendId, EvictionOrder, QueueOrder};
 use gate_llama::{
     Capabilities, Dialects, Health, Measurer, MeasurerConfig, Server, Timeouts, TokenCache,
@@ -45,7 +46,7 @@ use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex, RwLock};
 use tokio::net::TcpListener;
 use tokio::sync::watch;
-use tracing::info;
+use tracing::{info, warn};
 
 /// The example configuration shipped with the gate, fully commented.
 pub const EXAMPLE_CONFIG: &str = include_str!("../../../examples/llama-gate.toml");
@@ -186,16 +187,17 @@ impl Gate {
                 health,
                 measurer,
             });
-            watchers.push((id, server, health_sender, measurer_sender));
-            links.push((link, backend));
+            let store = open_store(&config, &backend);
+            watchers.push((id, server, health_sender, measurer_sender, store.clone()));
+            links.push((link, backend, store));
         }
         if let Some(default) = &config.server.default_model {
             models.set_default(default);
         }
-        let backends: Vec<Arc<BackendLink>> = links.iter().map(|(link, _)| link.clone()).collect();
+        let backends: Vec<Arc<BackendLink>> = links.iter().map(|(link, ..)| link.clone()).collect();
         let (engine, handle) = Engine::new(config.clone(), links, models.clone(), policies);
-        tokio::spawn(engine.run());
-        for (id, server, health, measurer) in watchers {
+        let mut engine = tokio::spawn(engine.run());
+        for (id, server, health, measurer, store) in watchers {
             tokio::spawn(watch_upstream(
                 id,
                 server,
@@ -204,6 +206,7 @@ impl Gate {
                 health,
                 measurer,
                 config.admission.incremental,
+                store,
             ));
         }
 
@@ -255,7 +258,7 @@ impl Gate {
                     return;
                 };
                 while hangup.recv().await.is_some() {
-                    match proxy::apply_reload(&state).await {
+                    match http::apply_reload(&state).await {
                         Ok(notes) => info!(?notes, "reloaded the configuration (SIGHUP)"),
                         Err(problem) => {
                             tracing::warn!(%problem, "the configuration was not reloaded")
@@ -272,16 +275,28 @@ impl Gate {
             mode = ?config.server.mode,
             "llama-gate listening"
         );
-        let app = proxy::router(state).into_make_service_with_connect_info::<SocketAddr>();
+        let app = http::router(state).into_make_service_with_connect_info::<SocketAddr>();
         let drain = config.server.drain.0;
         let (stopping, stopped) = tokio::sync::oneshot::channel::<()>();
+        let vitals = handle.vitals.clone();
         let graceful = async move {
             shutdown.await;
             info!("shutting down: refusing queued requests and draining running ones");
+            handle.vitals.drain();
             handle.shutdown().await;
             let _ = stopping.send(());
         };
         let server = axum::serve(listener, app).with_graceful_shutdown(graceful);
+        // Without its engine the gate can only refuse: better to stop and be
+        // restarted than to answer 503 to everything while looking up. (An
+        // engine that stops because the gate is shutting down is expected.)
+        let engine_lost = async move {
+            let ended = (&mut engine).await;
+            if vitals.draining() {
+                std::future::pending::<()>().await;
+            }
+            ended
+        };
         tokio::select! {
             result = server => result,
             () = async move {
@@ -291,6 +306,41 @@ impl Gate {
                 info!("drain period over; closing remaining connections");
                 Ok(())
             }
+            ended = engine_lost => {
+                let why = match ended {
+                    Err(error) if error.is_panic() => "the scheduler panicked",
+                    _ => "the scheduler stopped",
+                };
+                tracing::error!("{why}; exiting so the gate can be restarted");
+                Err(std::io::Error::other(why))
+            }
+        }
+    }
+}
+
+/// Takes ownership of a swapping backend's snapshot directory. Without one,
+/// the backend discards idle contexts instead of saving them.
+fn open_store(config: &Config, backend: &BackendConfig) -> Option<SnapshotStore> {
+    if config.eviction.mode != EvictionMode::Swap {
+        return None;
+    }
+    let Some(directory) = backend.snapshots.as_deref() else {
+        warn!(
+            backend = backend.name,
+            "eviction.mode is swap but this backend has no snapshot directory; its idle contexts will be discarded"
+        );
+        return None;
+    };
+    match SnapshotStore::open(directory) {
+        Ok(store) => Some(store),
+        Err(error) => {
+            warn!(
+                backend = backend.name,
+                directory = %directory.display(),
+                %error,
+                "cannot use the snapshot directory; this backend's idle contexts will be discarded"
+            );
+            None
         }
     }
 }

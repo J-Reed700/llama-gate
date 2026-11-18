@@ -374,7 +374,24 @@ async fn chat(State(state): State<Arc<FakeState>>, Json(body): Json<Value>) -> R
         })
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(8);
-    let limit = body["max_tokens"].as_u64().unwrap_or(u64::MAX);
+    // `fail:N` in the last message: report an error after N tokens, inside
+    // the 200 stream, as llama.cpp does.
+    let fail_at = body["messages"]
+        .as_array()
+        .and_then(|messages| messages.last())
+        .and_then(|message| message["content"].as_str())
+        .and_then(|text| {
+            text.split_whitespace()
+                .find_map(|word| word.strip_prefix("fail:"))
+        })
+        .and_then(|value| value.parse::<u64>().ok());
+    // As llama.cpp resolves it: the first of these present wins, and a
+    // negative value means no limit.
+    let limit = ["n_predict", "max_completion_tokens", "max_tokens"]
+        .iter()
+        .find_map(|key| body[*key].as_i64())
+        .and_then(|limit| u64::try_from(limit).ok())
+        .unwrap_or(u64::MAX);
     let generate = hint.min(limit);
     let streaming = body["stream"].as_bool().unwrap_or(false);
     let pinned = body["id_slot"]
@@ -418,12 +435,36 @@ async fn chat(State(state): State<Arc<FakeState>>, Json(body): Json<Value>) -> R
         }))
         .into_response();
     }
+    // With `return_progress`, llama.cpp reports prompt processing as it
+    // goes: role-only chunks carrying `prompt_progress`, before any output.
+    let steps: u64 = if body["return_progress"].as_bool() == Some(true) && !prefill.is_zero() {
+        4
+    } else {
+        0
+    };
+    let progress = futures_util::stream::unfold(0u64, move |step| async move {
+        if step >= steps {
+            return None;
+        }
+        tokio::time::sleep(prefill / steps as u32).await;
+        let chunk = format!(
+            "data: {}\n\n",
+            json!({"choices": [{"delta": {"role": "assistant", "content": null}, "finish_reason": null, "index": 0}],
+                   "prompt_progress": {"total": prompt, "cache": 0, "processed": prompt * (step + 1) / steps, "time_ms": 0}})
+        );
+        Some((Ok::<_, std::io::Error>(Bytes::from(chunk)), step + 1))
+    });
     let stream = futures_util::stream::unfold((0u64, Some(busy)), move |(index, busy)| {
         let state = state.clone();
         async move {
             let mut busy = busy?;
-            if index == 0 && !prefill.is_zero() {
+            if index == 0 && !prefill.is_zero() && steps == 0 {
                 tokio::time::sleep(prefill).await;
+            }
+            if fail_at == Some(index) {
+                let chunk = "data: {\"error\":{\"code\":500,\"message\":\"the model crashed\",\"type\":\"server_error\"}}\n\n";
+                drop(busy);
+                return Some((Ok(Bytes::from(chunk)), (generate + 1, None)));
             }
             if index < generate {
                 tokio::time::sleep(delay).await;
@@ -458,7 +499,9 @@ async fn chat(State(state): State<Arc<FakeState>>, Json(body): Json<Value>) -> R
     });
     Response::builder()
         .header("content-type", "text/event-stream")
-        .body(axum::body::Body::from_stream(stream))
+        .body(axum::body::Body::from_stream(
+            futures_util::StreamExt::chain(progress, stream),
+        ))
         .unwrap()
 }
 

@@ -27,6 +27,10 @@ pub(crate) struct Backend {
     pub partial: bool,
     pub partial_hits: u32,
     pub partial_misses: u32,
+    /// Added to every reservation here: the largest recent excess of a
+    /// finished context over what was reserved for it (prompts the gate
+    /// measured short, tokens the server adds). It decays as contexts fit.
+    pub overrun: Tokens,
 }
 
 impl Backend {
@@ -41,6 +45,7 @@ impl Backend {
             partial: true,
             partial_hits: 0,
             partial_misses: 0,
+            overrun: 0,
         }
     }
 

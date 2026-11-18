@@ -252,9 +252,12 @@ impl Pool {
         }
     }
 
-    /// Whether nothing but slot `index` holds anything.
+    /// Whether nothing but slot `index` holds anything: no other slot's
+    /// ledger, and no slot still to be erased of content the gate did not
+    /// place (a sweep can owe nothing yet still be erasing).
     pub fn others_usage_is_zero(&self, index: usize) -> bool {
         self.stray == 0
+            && self.strays.is_empty()
             && self
                 .slots
                 .iter()

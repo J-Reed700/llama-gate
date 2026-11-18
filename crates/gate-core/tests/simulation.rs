@@ -239,7 +239,11 @@ fn run(seed: u64) {
             gate.advance(10_000);
             continue;
         };
-        gate.finish(ticket, 1);
+        // A request granted no generation (an embedding) generates nothing.
+        let generation = gate
+            .was_dispatched(ticket)
+            .map_or(0, |dispatch| dispatch.generation);
+        gate.finish(ticket, generation.min(1));
     }
 
     for ticket in &arrived {
@@ -268,8 +272,25 @@ fn run(seed: u64) {
     assert_eq!(
         gate.scheduler.waiting(),
         0,
-        "seed {seed}: requests left waiting: {:?}",
-        gate.scheduler.status(gate.now).waiting
+        "seed {seed}: requests left waiting: {:?}\nbackends: {:?}\nnotices: {:?}",
+        gate.scheduler.status(gate.now).waiting,
+        gate.scheduler
+            .status(gate.now)
+            .backends
+            .iter()
+            .map(|backend| (
+                backend.usage,
+                backend.capacity,
+                backend.stray,
+                backend.online,
+                backend
+                    .slots
+                    .iter()
+                    .map(|slot| (slot.state, slot.tokens))
+                    .collect::<Vec<_>>()
+            ))
+            .collect::<Vec<_>>(),
+        gate.notices.iter().take(5).collect::<Vec<_>>()
     );
     let status = gate.scheduler.status(gate.now);
     for backend in &status.backends {

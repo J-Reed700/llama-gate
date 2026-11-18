@@ -728,3 +728,79 @@ fn a_new_configuration_keeps_everyone_in_line() {
     assert!(gate.was_dispatched(batch).is_some());
     assert!(gate.was_dispatched(chat).is_none());
 }
+
+/// A request for several answers at once (`n` = 2) is granted one slot, but
+/// the server runs each answer in a slot of its own. The ledger must account
+/// for every copy until those slots are erased, or a large request admitted
+/// next overfills the pool (the copies are invisible to a one-slot booking).
+#[test]
+fn several_answers_at_once_leave_no_hidden_context() {
+    let mut gate = Setup::unified(100_000, 2).build();
+    let pair = gate.arrive_with(1, ClassId(0), 40_000, 1_000, prefix(1, 40_000), true);
+    assert!(gate.was_dispatched(pair).is_some());
+    // Erasing takes time: the next request arrives while it is under way.
+    gate.auto = false;
+    gate.finish_spread(pair, 1_000, &[0, 1]);
+    let large = gate.arrive(2, 50_000, 10_000, prefix(2, 50_000));
+    let granted = |gate: &support::Harness| {
+        gate.pending
+            .iter()
+            .any(|command| matches!(command, Command::Dispatch { ticket, .. } if *ticket == large))
+    };
+    assert!(
+        !granted(&gate),
+        "waits while the server's copies may still fill the pool"
+    );
+    gate.drain();
+    assert!(
+        gate.was_dispatched(large).is_some(),
+        "runs once they are erased"
+    );
+}
+
+/// A request spread over several slots cannot be paused: stopping it frees
+/// no single slot the waiting request could use.
+#[test]
+fn several_answers_at_once_are_not_paused() {
+    let mut setup = Setup::unified(100_000, 2);
+    let mut batch = class("batch", 0);
+    batch.preemptible = true;
+    setup.classes = vec![batch, class("interactive", 10)];
+    let mut gate = setup.build();
+    let pair = gate.arrive_with(1, ClassId(0), 40_000, 20_000, prefix(1, 40_000), true);
+    assert!(gate.was_dispatched(pair).is_some());
+    let urgent = gate.arrive_with(2, ClassId(1), 50_000, 5_000, prefix(2, 50_000), false);
+    gate.drain();
+    assert!(
+        gate.was_dispatched(urgent).is_none(),
+        "the spread request keeps running"
+    );
+    assert_eq!(gate.dispatches(pair), 1);
+}
+
+/// A context that finishes larger than its reservation (a prompt measured
+/// short) means the pool may have overflowed while it ran. The gate says so
+/// and reserves the excess on top of every later request.
+#[test]
+fn an_overrun_is_reported_and_reserved_against() {
+    let mut gate = Setup::unified(200_000, 2).build();
+    let first = gate.arrive(1, 50_000, 10_000, prefix(1, 50_000));
+    // The server held 17,000 tokens more than was reserved.
+    gate.finish(first, 27_000);
+    assert!(gate.notices.iter().any(|notice| matches!(
+        notice,
+        Notice::Overran {
+            reserved: 60_000,
+            resident: 77_000,
+            ..
+        }
+    )));
+    let second = gate.arrive(2, 50_000, 10_000, prefix(2, 50_000));
+    assert!(gate.was_dispatched(second).is_some());
+    let usage = gate.scheduler.status(gate.now).backends[0].usage;
+    assert_eq!(
+        usage,
+        77_000 + 77_000,
+        "the idle first context plus a padded reservation"
+    );
+}

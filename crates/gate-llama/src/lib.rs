@@ -13,12 +13,15 @@
 //!   address, exactly when the server can tokenize and conservatively when
 //!   it cannot. [`TokenCache`] makes that cheap for long conversations by
 //!   tokenizing only what is new since their previous turn.
-//! - [`usage`] reads the final token counts from a finished response.
+//! - [`stream`] reads a response as it passes: whether each event is
+//!   output, whether the request failed, and the tokens it reports.
+//! - [`usage`] holds those token counts.
 #![forbid(unsafe_code)]
 
 mod dialect;
 mod measure;
 mod server;
+pub mod stream;
 pub mod tokens;
 pub mod usage;
 
@@ -30,4 +33,5 @@ pub use measure::{Measurement, Measurer, MeasurerConfig};
 pub use server::{
     Capabilities, Health, Piece, Server, ServerError, ServerInfo, SlotReport, SlotView, Timeouts,
 };
+pub use stream::Wire;
 pub use tokens::{Boundaries, Method, TokenCache};

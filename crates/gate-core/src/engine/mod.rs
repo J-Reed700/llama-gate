@@ -92,7 +92,15 @@ pub enum Event {
         now: Millis,
     },
     /// The client went away (before or after it was dispatched).
-    Withdrawn { ticket: TicketId, now: Millis },
+    /// The request left: its client went away, or it failed. `relayed` is
+    /// the output its client was sent, when the caller counted it; a running
+    /// request is charged that (or, uncounted, its whole grant) so that
+    /// hanging up cannot buy a client more than its share.
+    Withdrawn {
+        ticket: TicketId,
+        relayed: Option<Tokens>,
+        now: Millis,
+    },
     /// A dispatched request's output began reaching its client, so it can no
     /// longer be paused.
     Started { ticket: TicketId, now: Millis },
@@ -293,6 +301,15 @@ pub enum Notice {
     /// a prompt (its model cannot rewind to them), so they are no longer
     /// offered there.
     PartialReuseIneffective { backend: BackendId },
+    /// A finished context was larger than the gate had reserved for it: the
+    /// pool may have been overfilled while it ran. Reservations on this
+    /// backend now carry the excess as a margin.
+    Overran {
+        backend: BackendId,
+        ticket: TicketId,
+        reserved: Tokens,
+        resident: Tokens,
+    },
 }
 
 pub struct Scheduler {
@@ -348,7 +365,9 @@ impl Scheduler {
         let mut out = Vec::new();
         match event {
             Event::Arrived { ticket, demand, .. } => self.arrive(ticket, demand, now, &mut out),
-            Event::Withdrawn { ticket, .. } => self.withdraw(ticket, now, &mut out),
+            Event::Withdrawn {
+                ticket, relayed, ..
+            } => self.withdraw(ticket, relayed, now, &mut out),
             Event::Started { ticket, .. } => self.started(ticket),
             Event::Finished {
                 ticket,
@@ -511,7 +530,13 @@ impl Scheduler {
         });
     }
 
-    fn withdraw(&mut self, ticket: TicketId, now: Millis, out: &mut Vec<Command>) {
+    fn withdraw(
+        &mut self,
+        ticket: TicketId,
+        relayed: Option<Tokens>,
+        now: Millis,
+        out: &mut Vec<Command>,
+    ) {
         if let Some(index) = self.position(ticket) {
             // A paused request may still be stopping; its slot completes on
             // its own.
@@ -523,7 +548,10 @@ impl Scheduler {
         };
         match self.slot_mut(slot) {
             Some(SlotState::Preparing(claim)) => claim.abandoned = true,
-            Some(SlotState::Running(_)) => self.finish(ticket, None, None, None, now, out),
+            Some(SlotState::Running(running)) => {
+                let charged = relayed.unwrap_or(running.waiting.demand.generation);
+                self.finish(ticket, None, Some(charged), None, now, out);
+            }
             _ => {}
         }
     }
@@ -575,17 +603,57 @@ impl Scheduler {
         // Without a report the slot may hold anything up to its reservation.
         let tokens = resident.unwrap_or(running.reserved);
         let demand = &running.waiting.demand;
-        if demand.pinned {
+        if demand.pinned && !demand.exclusive {
             *state = SlotState::Idle(Resident {
                 tokens,
                 prefix: demand.prefix.clone(),
                 last_used: now,
             });
         } else {
-            self.strayed(slot, tokens, now, out);
+            // The server chose its slots: an unpinned request's context is in
+            // one of them, and several prompts or answers at once (`n`, a
+            // prompt list) left a context in each slot they ran in. Until those
+            // slots are erased, the pool may hold all it reserved.
+            let debt = if demand.exclusive {
+                running.reserved.max(tokens)
+            } else {
+                tokens
+            };
+            self.strayed(slot, debt, now, out);
+        }
+        if let Some(resident) = resident {
+            self.settle(slot.backend, ticket, running.reserved, resident, out);
         }
         self.charge_generation(&running.waiting.demand, generated);
         self.learn(slot.backend, running.reuse, cached, out);
+    }
+
+    /// Compares a finished context with its reservation: an excess becomes a
+    /// margin on every later reservation (and a notice), a fit decays it.
+    fn settle(
+        &mut self,
+        id: BackendId,
+        ticket: TicketId,
+        reserved: Tokens,
+        resident: Tokens,
+        out: &mut Vec<Command>,
+    ) {
+        let Some(backend) = self.backend_mut(id) else {
+            return;
+        };
+        if resident > reserved {
+            // One wild report must not cost the pool more than an eighth.
+            let ceiling = backend.pool.capacity() / 8;
+            backend.overrun = backend.overrun.max((resident - reserved).min(ceiling));
+            out.push(Command::Notice(Notice::Overran {
+                backend: id,
+                ticket,
+                reserved,
+                resident,
+            }));
+        } else {
+            backend.overrun = backend.overrun.saturating_sub(backend.overrun.div_ceil(64));
+        }
     }
 
     /// An unpinned request in `slot` finished; its context is in whichever
