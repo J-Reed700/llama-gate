@@ -1,0 +1,57 @@
+# llama-server reachable only through llama-gate.
+#
+#   docker compose -f deploy/docker-compose.yml up -d
+#
+# Clients use http://localhost:8080 exactly as they would use llama-server.
+services:
+  llama:
+    image: ghcr.io/ggml-org/llama.cpp:server-cuda
+    command:
+      - --model
+      - /models/model.gguf
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8081"
+      - --parallel
+      - "2"
+      - --kv-unified
+      # The gate saves idle contexts here and restores them on demand.
+      - --slot-save-path
+      - /slots/
+    volumes:
+      - ./models:/models:ro
+      - slots:/slots
+    networks: [internal]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    # No published port: only the gate reaches the server.
+
+  gate:
+    build: ..
+    environment:
+      LLAMA_GATE_UPSTREAM: http://llama:8081
+      LLAMA_GATE_CONFIG: /etc/llama-gate.toml
+    volumes:
+      - ./llama-gate.toml:/etc/llama-gate.toml:ro
+      # The same directory as --slot-save-path: the gate indexes and deletes
+      # the files the server writes. It must be writable by the gate's user.
+      - slots:/slots
+    # llama-server writes snapshots as root; let the gate manage them.
+    user: "0:0"
+    ports:
+      - "8080:8080"
+    networks: [internal, default]
+    depends_on: [llama]
+
+networks:
+  internal:
+    internal: true
+
+volumes:
+  slots: {}

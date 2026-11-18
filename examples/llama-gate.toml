@@ -1,0 +1,264 @@
+# llama-gate configuration
+#
+# Every key is optional; the values shown are the defaults. An empty file
+# gives a working gate in front of http://127.0.0.1:8081 on port 8080.
+# Durations accept ms/s/m/h/d ("250ms", "30s", "10m"); sizes accept
+# B/KB/MB/GB/TB and KiB/MiB/GiB/TiB. SIGHUP (or POST /gate/reload) reloads
+# this file: classes, clients, keys, and admission, queue, and eviction
+# settings apply at once; backends and the listen address need a restart.
+
+[server]
+# Where clients connect. Point your apps here instead of at llama-server.
+listen = "0.0.0.0:8080"
+# The llama.cpp server, when no [[backends]] are listed (any build of
+# llama-server that exposes its standard HTTP API).
+upstream = "http://127.0.0.1:8081"
+# enforce: schedule every generative request (the point of the gate).
+# observe: measure and log, but forward at once (try it on live traffic).
+# bypass:  a plain reverse proxy.
+mode = "enforce"
+# Largest request body accepted; images arrive base64-encoded.
+max_body = "64MiB"
+# After a shutdown signal, how long running requests may finish.
+drain = "30s"
+# Headers removed before forwarding. x-conversation-id makes llama.cpp keep
+# generating after a client disconnects, which would hide that work.
+strip_request_headers = ["x-conversation-id"]
+# The gate owns the slots; refuse /slots/{id}?action=... from clients.
+allow_slot_actions = false
+# How often each server's health and shape are checked.
+health_interval = "2s"
+# While no server of a request's model is up (say, mid-restart), the
+# request waits this long, then is refused with 503. Nothing reached a
+# server, so waiting is safe. "0s" waits indefinitely.
+upstream_wait = "2m"
+# The model requests that name none, or an unknown one, go to. Default: the
+# first backend's.
+# default_model = "qwen"
+
+# Several servers: list them instead of `upstream`. Backends naming the same
+# model are interchangeable replicas; requests pick a model by its name (or
+# an alias) in their `model` field. Each server needs its own snapshot
+# directory.
+#
+# [[backends]]
+# name = "gpu0"
+# url = "http://127.0.0.1:8081"
+# model = "qwen"                 # the name clients use (default: the backend's name)
+# aliases = ["gpt-4o-mini"]      # more names for it
+# snapshots = "/var/lib/llama/slots-gpu0"   # its --slot-save-path
+# # api_key = "env:LLAMA_KEY"    # sent as a bearer token (llama-server --api-key)
+# # layout = "split"             # override [kv] for this server
+# # capacity = 0
+# # margin = 1024
+#
+# [[backends]]
+# name = "gpu1"
+# url = "http://127.0.0.1:8082"
+# model = "qwen"
+# snapshots = "/var/lib/llama/slots-gpu1"
+#
+# A llama-server in router mode (several models behind one URL): one backend
+# per model, each with `router = true` so the gate addresses that model.
+#
+# [[backends]]
+# name = "router-gemma"
+# url = "http://127.0.0.1:8090"
+# model = "ggml-org/gemma-3-4b-it-GGUF:Q4_K_M"
+# router = true
+
+[kv]
+# llama.cpp does not report whether its cache is unified, so say so here
+# (`llama-gate -- llama-server ...` reads it from the server's flags).
+# unified: one KV pool shared by every slot (llama-server --kv-unified, the
+#          default when it chooses the slot count). Safe when unsure.
+# split:   each slot owns n_ctx / n_parallel cells and cannot affect others.
+layout = "unified"
+# Total cells (unified) or cells per slot (split). 0 asks the server.
+capacity = 0
+# Cells never handed out.
+margin = 1024
+
+[admission]
+# New tokens reserved for a request that sets no limit. Cover a reasoning
+# model's thinking budget plus its answer.
+default_generation = 32768
+# Ceiling on any one request's reservation; 0 lets only the pool limit it.
+max_generation = 0
+# Requests whose prompt leaves less room than this are refused (HTTP 400,
+# code context_length_exceeded) instead of failing on the server.
+min_generation = 256
+# Write the granted limit into each request (max_tokens, n_predict, ...), so
+# a running request can never outgrow its reservation. Leave on.
+enforce_generation = true
+# Tokens assumed per image or audio item, which tokenization cannot see.
+media_tokens = 4096
+# Bytes per token assumed when the server cannot tokenize (conservative).
+bytes_per_token = 2.0
+# Tokens per block when content-addressing prompts (cache affinity and
+# snapshot matching). 64 matches llm-d.
+prefix_block = 64
+# Tokenize only what is new since a conversation's previous turn: a long
+# conversation's prompt is measured in milliseconds rather than tenths of a
+# second. The gate learns where the chat template may be cut and checks
+# itself against full tokenizations; one disagreement turns it off for that
+# model.
+incremental = true
+# Tokens of conversation heads kept for that.
+token_cache = 4194304
+# After the first few, one incremental result in this many is checked.
+verify_every = 32
+
+[queue]
+# vtc:  Virtual Token Counter fair queueing between clients (OSDI '24).
+# fifo: first come, first served.
+order = "vtc"
+# VTC cost of a prompt token and of a generated token.
+input_weight = 1.0
+output_weight = 2.0
+# A streaming request queued longer than keepalive_after receives SSE
+# comment pings (": queued") every keepalive_interval, so clients and
+# proxies keep the connection open. "0s" disables the pings.
+keepalive_after = "5s"
+keepalive_interval = "15s"
+# Retry-After sent with 429 and 503 refusals.
+retry_after = "5s"
+# How often queue timeouts and retries are evaluated.
+tick = "500ms"
+# How often one request may be paused for more urgent work (see
+# `preemptible` below) before it runs undisturbed.
+max_preemptions = 3
+
+[queue.backfill]
+# Small requests may run ahead of a large one that waits for running work,
+# but only until it has waited `window` (EASY-style backfilling).
+enabled = true
+max_tokens = 16384
+window = "60s"
+
+[eviction]
+# swap:    save an idle context to disk before clearing it, and restore it
+#          when its conversation returns. Needs llama-server
+#          --slot-save-path DIR and `directory` below pointing at DIR.
+# discard: clear idle contexts; a returning conversation is recomputed.
+mode = "swap"
+# Which idle context gives way first: least_recently_used, smallest, largest.
+victim = "least_recently_used"
+# The server's --slot-save-path as this process sees it (mount the same
+# directory into both), when no [[backends]] are listed. Unset or
+# unreachable: swap falls back to discard.
+# directory = "/var/lib/llama/slots"
+# Disk space for each server's saved contexts; least recently used go first.
+budget = "32GiB"
+# Contexts smaller than this are cleared rather than saved.
+min_snapshot_tokens = 4096
+# Restore a saved context only if it covers this many more tokens than the
+# slot would reuse anyway (also the least sharing worth a partial reuse).
+min_restore_gain = 2048
+# Reuse contexts that share only the start of a prompt (a common system
+# prompt, a rewound conversation), not just exact continuations. Turned off
+# by itself on a server whose model cannot rewind to them (some hybrid and
+# sliding-window models), as measured from the cache reuse it reports.
+partial_reuse = true
+# Wait before retrying a slot the server failed to clear.
+retry = "5s"
+
+# Scheduling classes. Higher priority is always served first; within a
+# priority, clients share by weight. With no classes configured, a single
+# "standard" class (priority 0) is used.
+[classes.standard]
+priority = 0
+weight = 1.0
+# max_wait = "10m"              # refuse with 429 after waiting this long
+# max_queued_per_client = 64    # refuse with 429 beyond this many waiting
+# default_generation = 32768    # overrides [admission] for this class
+# max_generation = 65536
+# A request of a preemptible class may be paused for one of a higher
+# priority while it has shown nothing yet (still reading its prompt, or a
+# non-streaming request): it is stopped, its progress saved, and it resumes
+# where it stopped, its client none the wiser. Output already streaming is
+# never interrupted.
+preemptible = false
+
+# [classes.interactive]
+# priority = 10
+# max_wait = "30m"
+#
+# [classes.agents]
+# priority = 0
+# preemptible = true
+#
+# [classes.batch]
+# priority = -10
+# preemptible = true
+# max_wait = "2h"
+
+[clients]
+# Class for requests no rule or key matches.
+default_class = "standard"
+# Header naming a client (its fairness flow). Requests without it are told
+# apart by key, rule, the OpenAI `user` field, then address.
+identity_header = "x-gate-client"
+# Header naming a class; honoured only when trust_class_header is true.
+class_header = "x-gate-class"
+trust_class_header = false
+use_openai_user = true
+# Never place one client's request on another client's cached context, so
+# no client can learn from cache timings what another sent.
+isolate = false
+# How often rule host names (for example container names) are re-resolved.
+resolve_interval = "30s"
+
+# Rules match requests by source; the first match wins. A rule matches a
+# source network (cidrs), a host name's addresses (hosts), or a header.
+#
+# [[clients.rules]]
+# name = "chat-ui"
+# class = "interactive"
+# hosts = ["open-webui"]
+#
+# [[clients.rules]]
+# name = "nightly-jobs"
+# class = "batch"
+# cidrs = ["10.0.5.0/24"]
+#
+# [[clients.rules]]
+# name = "agents"
+# class = "agents"
+# header = { name = "x-team", value = "agents" }
+
+[auth]
+# API keys, presented as `Authorization: Bearer <key>` or `x-api-key`. Give
+# a key as itself, as "sha256:<hex digest>" (so the file holds no secret),
+# or as "env:VARIABLE".
+# Refuse requests without a known key (401). Otherwise keys only name their
+# clients, and other requests are identified by rule (an unknown key is left
+# for the server to judge).
+required = false
+# Keys for the gate's own endpoints (status, events, metrics, reload).
+# Empty: those are open to anyone who can reach the gate.
+admin_keys = []
+# Let Prometheus scrape /gate/metrics without an admin key.
+public_metrics = false
+#
+# [[auth.keys]]
+# key = "env:DESKTOP_APP_KEY"
+# client = "desktop-app"
+# class = "interactive"
+
+[observe]
+# The gate's own endpoints: {prefix}/ (the live dashboard), {prefix}/status
+# (JSON), {prefix}/events (Server-Sent Events), {prefix}/metrics
+# (Prometheus), {prefix}/health, and POST {prefix}/reload.
+path_prefix = "/gate"
+# text or json.
+log_format = "text"
+# Default log filter; RUST_LOG overrides it.
+log_level = "info"
+# Serve the live dashboard.
+dashboard = true
+# One log line per finished request: client, model, server, tokens, cache
+# reuse, measuring, queueing, time to first token, tokens per second.
+access_log = true
+# Finished requests kept for the status page and dashboard.
+recent = 200

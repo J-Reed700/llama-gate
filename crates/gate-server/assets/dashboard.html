@@ -1,0 +1,906 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="dark light">
+<title>llama-gate</title>
+<link rel="icon" href="data:,">
+<style>
+:root{color-scheme:dark;
+--bg:#0b0d11;--panel:#12151b;--panel-2:#191d25;--track:#1a1f27;--line:#242a33;--line-soft:#1b2028;--line-2:#343b48;--hover:rgba(255,255,255,.03);
+--text:#e3e6ea;--text-2:#a3aab5;--muted:#6f7783;--run:#2f7be2;--run-hi:#6aa3ef;--idle:#4a5363;
+--accent:#4a90ee;--good:#34b45f;--warn:#e0a21b;--serious:#ef7d47;--bad:#e5484d;--violet:#9a8ff0;--aqua:#2fb79d;--magenta:#da64a0;
+--shadow:0 12px 32px rgba(0,0,0,.55);
+--font:system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;
+--mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace}
+@media (prefers-color-scheme:light){:root{color-scheme:light;
+--bg:#f3f4f6;--panel:#fff;--panel-2:#f7f8fa;--track:#eceef2;--line:#e1e4e9;--line-soft:#eef0f3;--line-2:#cdd2da;--hover:rgba(0,0,0,.028);
+--text:#14171c;--text-2:#49505b;--muted:#737b87;--run:#2a74d1;--run-hi:#79a9e8;--idle:#a9b2bf;
+--accent:#2a74d1;--good:#1e8e46;--warn:#c58400;--serious:#d6612b;--bad:#d03b3b;--violet:#6a58d9;--aqua:#13917b;--magenta:#c2447f;
+--shadow:0 12px 32px rgba(20,25,35,.16)}}
+*,::before,::after{box-sizing:border-box}
+[hidden]{display:none!important}
+body{margin:0;background:var(--bg);color:var(--text);font:13px/1.45 var(--font);-webkit-text-size-adjust:100%}
+b,strong{font-weight:600}
+code,.n{font-family:var(--mono);font-variant-numeric:tabular-nums;font-size:12px}
+.mut{color:var(--muted)}
+abbr[title]{text-underline-offset:3px;cursor:help}
+:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+.ic{width:14px;height:14px;flex:none;fill:none;stroke:currentColor;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round}
+.wrap{max-width:1680px;margin:0 auto;padding:0 24px}
+
+.top{position:sticky;top:0;z-index:5;background:color-mix(in srgb,var(--bg) 90%,transparent);backdrop-filter:blur(8px);border-bottom:1px solid var(--line)}
+.top-in{display:flex;flex-wrap:wrap;align-items:center;gap:8px 20px;padding-top:10px;padding-bottom:10px}
+.brand,.hmeta{display:flex;flex-wrap:wrap;align-items:center;gap:8px 10px}
+.hmeta{gap:8px 16px;margin-left:auto;min-width:0}
+.logo{width:20px;height:20px;color:var(--accent);fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
+h1{margin:0;font-size:15px;font-weight:650}
+.conn{display:inline-flex;align-items:center;gap:7px;font-weight:550;white-space:nowrap}
+.conn .dot{width:8px;height:8px}
+.conn.t-good .dot,.pulse{animation:beat 1.6s ease-in-out infinite}
+.models{display:flex;flex-wrap:wrap;gap:6px;min-width:0}
+.chip{font:11.5px/18px var(--mono);padding:0 8px;border:1px solid var(--line-2);border-radius:999px;color:var(--text-2);max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+
+.t-good{--tone:var(--good)}.t-bad{--tone:var(--bad)}.t-warn{--tone:var(--warn)}.t-serious{--tone:var(--serious)}.t-muted{--tone:var(--muted)}
+.t-accent{--tone:var(--accent)}.t-violet{--tone:var(--violet)}.t-aqua{--tone:var(--aqua)}.t-magenta{--tone:var(--magenta)}
+.dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--tone,var(--muted));flex:none}
+.badge{display:inline-flex;align-items:center;gap:5px;height:19px;padding:0 7px;border-radius:4px;font-size:11.5px;font-weight:500;white-space:nowrap;color:var(--text);background:color-mix(in srgb,var(--tone) 13%,transparent);border:1px solid color-mix(in srgb,var(--tone) 34%,transparent)}
+td .badge+.badge{margin-left:4px}
+@keyframes beat{50%{opacity:.35}}
+.btn{display:inline-flex;align-items:center;gap:6px;height:32px;padding:0 12px;border-radius:6px;border:1px solid var(--line-2);background:var(--panel-2);color:var(--text);font:500 12.5px var(--font);cursor:pointer;white-space:nowrap}
+.btn:hover{border-color:var(--muted)}
+.btn.primary{background:var(--run);border-color:var(--run);color:#fff}
+.btn.ghost{background:none}
+.btn.sm{height:26px;padding:0 9px;font-size:12px}
+input{font:13px var(--mono);color:var(--text);background:var(--bg);border:1px solid var(--line-2);border-radius:6px;height:32px;padding:0 10px;min-width:0}
+
+/* one column; from 1360px the feed sits beside queue and clients */
+main{display:grid;gap:16px;padding-top:14px;padding-bottom:40px;grid-template-columns:minmax(0,1fr);grid-template-areas:"auth" "bk" "q" "cl" "rc" "fd"}
+#auth{grid-area:auth}.area-bk{grid-area:bk}.area-q{grid-area:q}.area-cl{grid-area:cl}.area-rc{grid-area:rc}.area-fd{grid-area:fd}
+@media (min-width:1360px){
+main{grid-template-columns:minmax(0,1fr) minmax(380px,440px);grid-template-areas:"auth auth" "bk bk" "q fd" "cl fd" "rc rc"}
+.area-fd{contain:size;min-height:440px;display:flex;flex-direction:column}
+.area-fd .feed{flex:1;min-height:0;max-height:none}}
+body.stale main>section:not(#auth){opacity:.55;transition:opacity .3s}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:8px;min-width:0}
+.ph,.sh{display:flex;align-items:center;gap:10px}
+.ph{min-height:40px;padding:6px 14px;border-bottom:1px solid var(--line)}
+.sh{margin:2px 2px 10px}
+h2,.kv-l{margin:0;font-size:11.5px;font-weight:600;letter-spacing:.07em;text-transform:uppercase;color:var(--text-2);white-space:nowrap}
+.pm{margin-left:auto;color:var(--muted);font-size:12px;text-align:right;min-width:0}
+.empty{padding:26px 16px;text-align:center;color:var(--muted)}
+.empty strong{display:block;color:var(--text-2);font-weight:500}
+.note{margin-bottom:12px}
+.note-in{display:flex;gap:12px;align-items:flex-start;padding:14px 16px;background:var(--panel);border:1px solid var(--line);border-left:3px solid var(--tone);border-radius:8px}
+.note-in .dot{margin-top:5px}
+.note-in p{margin:2px 0 0;color:var(--text-2)}
+
+#auth{padding:14px 16px;border-color:color-mix(in srgb,var(--bad) 45%,var(--line))}
+.auth-h{display:flex;align-items:center;gap:8px;font-size:14px}
+.auth-h .ic{color:var(--bad);width:16px;height:16px}
+#auth p{margin:4px 0 0;color:var(--text-2)}
+#auth .mut{margin-top:8px;font-size:11.5px;color:var(--muted)}
+.auth-row{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px}
+.auth-row input{flex:1 1 240px;max-width:420px}
+
+.bk-grid{display:grid;gap:16px;grid-template-columns:repeat(auto-fit,minmax(min(100%,600px),1fr))}
+.bk{padding:14px 16px 0;display:flex;flex-direction:column;gap:10px}
+.bk.down{border-color:color-mix(in srgb,var(--bad) 40%,var(--line))}
+.bk.down .kv,.bk.down .tblwrap{opacity:.5}
+.bk-t,.bk-m{display:flex;flex-wrap:wrap;align-items:center;gap:6px 10px}
+.bk-m{gap:6px;margin-top:6px}
+.bk-t h3{margin:0;font-size:15px;font-weight:600}
+.model{font:12px var(--mono);color:var(--text-2)}
+.url{color:var(--muted);margin-right:4px;overflow-wrap:anywhere}
+.kv-h{display:flex;flex-wrap:wrap;align-items:baseline;gap:4px 10px;margin-top:4px}
+.kv-p{font-size:20px;font-weight:600}
+.kv-u{margin-left:auto;color:var(--text-2)}
+.kv-off{color:var(--bad);font-weight:500}
+.kv{display:flex;height:30px;border-radius:6px;overflow:hidden;background:var(--track);box-shadow:inset 0 0 0 1px var(--line)}
+.kv .seg{flex:none;display:flex;align-items:center;height:100%;min-width:3px;overflow:hidden;border-right:2px solid var(--panel);transition:width .45s ease}
+.kv .seg.z{min-width:0;border-right-width:0}
+.kv span{padding:0 6px;font:600 11px/1 var(--mono);color:#fff;white-space:nowrap}
+.kv [data-k]:hover{filter:brightness(1.18)}
+.kv [data-k]:focus-visible{outline:2px solid var(--text);outline-offset:-2px}
+.kv .k-free{flex:1 1 auto;min-width:0;border:0;justify-content:flex-end}
+.kv .k-free span{color:var(--muted);font-weight:500}
+.kv.split{gap:2px;background:none;box-shadow:none}
+.kv.split .box{flex:1 1 0;min-width:0;display:flex;overflow:hidden;border-radius:4px;background:var(--track);box-shadow:inset 0 0 0 1px var(--line)}
+.kv.split .seg{border:0}
+.k-running{background:var(--run)}
+.k-idle{background:var(--idle)}
+.kv .k-idle span{color:var(--text)}
+.k-faulted{background:var(--bad)}
+.k-preparing{background:repeating-linear-gradient(-45deg,var(--run) 0 4px,var(--run-hi) 4px 8px)}
+.k-evicting{background:repeating-linear-gradient(-45deg,var(--warn) 0 4px,color-mix(in srgb,var(--warn) 50%,var(--track)) 4px 8px)}
+.k-preempting{background:repeating-linear-gradient(-45deg,var(--serious) 0 4px,color-mix(in srgb,var(--serious) 50%,var(--track)) 4px 8px)}
+.k-stray{background:repeating-linear-gradient(45deg,var(--violet) 0 2px,color-mix(in srgb,var(--violet) 30%,var(--track)) 2px 6px)}
+.kv .k-preparing,.kv .k-evicting,.kv .k-preempting{background-size:11.3137px 11.3137px;animation:slide 1s linear infinite}
+.kv .k-evicting span,.kv .k-preempting span{color:#14100a}
+.kv .k-preparing span{text-shadow:0 0 3px rgba(0,0,0,.6)}
+@keyframes slide{to{background-position:11.3137px 0}}
+.sw{display:inline-block;width:10px;height:10px;border-radius:2px;flex:none}
+.sw.k-empty,.sw.k-free{background:var(--track);box-shadow:inset 0 0 0 1px var(--line-2)}
+.lg{display:flex;flex-wrap:wrap;gap:4px 14px;font-size:12px;color:var(--text-2)}
+.li,.stt{display:inline-flex;align-items:center;gap:6px;white-space:nowrap}
+.bk .tblwrap{margin:0 -16px;padding:0 6px}
+.bk-f{display:flex;flex-wrap:wrap;justify-content:space-between;gap:4px 16px;margin:0 -16px;padding:9px 16px 10px;border-top:1px solid var(--line-soft);color:var(--text-2);font-size:12px}
+
+.tblwrap{overflow-x:auto}
+.scroll{max-height:560px;overflow:auto}
+.tbl{width:100%;border-collapse:collapse}
+.tbl th{position:sticky;top:0;z-index:1;background:var(--panel);text-align:left;font-size:11.5px;font-weight:500;color:var(--muted);padding:7px 8px;border-bottom:1px solid var(--line);white-space:nowrap}
+.tbl td{padding:5px 8px;border-bottom:1px solid var(--line-soft);white-space:nowrap}
+.tbl tbody tr:last-child td{border-bottom:0}
+.tbl tbody tr:hover td{background:var(--hover)}
+.tbl :is(th,td):first-child{padding-left:14px}
+.tbl :is(th,td):last-child{padding-right:14px}
+.tbl .r{text-align:right}
+.tbl tr.dim td{color:var(--muted)}
+.meter{display:inline-block;width:42px;height:6px;margin-right:8px;border-radius:3px;background:var(--track);overflow:hidden;vertical-align:middle}
+.meter i{display:block;height:100%;border-radius:3px;background:var(--aqua)}
+.meter.svc i{background:color-mix(in srgb,var(--accent) 75%,transparent)}
+
+.feed{list-style:none;margin:0;padding:2px 0;max-height:560px;overflow:auto}
+.ev{display:grid;grid-template-columns:auto auto minmax(0,1fr);gap:9px;align-items:start;padding:5px 14px;border-bottom:1px solid var(--line-soft)}
+.ev time{color:var(--muted);font-size:11.5px;line-height:19px}
+.ev .ic{margin-top:2.5px;color:var(--tone)}
+.ev>span{color:var(--text-2);overflow-wrap:anywhere}
+.ev b{color:var(--text)}
+.ev.fresh{animation:fresh 1.6s ease-out}
+@keyframes fresh{from{background:color-mix(in srgb,var(--tone) 16%,transparent)}}
+
+.tip{position:fixed;left:0;top:0;z-index:50;max-width:290px;padding:8px 10px;border-radius:6px;background:var(--panel-2);border:1px solid var(--line-2);box-shadow:var(--shadow);color:var(--text-2);font-size:12px;pointer-events:none}
+.tip b{display:block;color:var(--text);font:600 14px var(--mono)}
+.tt-h{display:flex;align-items:center;gap:7px;color:var(--text);font-weight:500}
+.tt-h span{color:var(--muted);font-weight:400;margin-left:auto;padding-left:10px}
+
+@media (max-width:640px){.wrap{padding:0 16px}.top{position:static}.hmeta{margin-left:0}.kv-p{font-size:18px}.feed{max-height:65vh}.scroll{max-height:70vh}}
+@media (prefers-reduced-motion:reduce){*,::before,::after{animation:none!important;transition:none!important}}
+@media (forced-colors:active){.kv .seg,.sw{border:1px solid CanvasText}}
+</style>
+</head>
+<body>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+<symbol id="i-go" viewBox="0 0 16 16"><path d="M2.5 8h10M9 4.5L12.5 8 9 11.5"/></symbol>
+<symbol id="i-ok" viewBox="0 0 16 16"><path d="M3 8.5l3.2 3L13 4.5"/></symbol>
+<symbol id="i-x" viewBox="0 0 16 16"><circle cx="8" cy="8" r="5.8"/><path d="M4 12L12 4"/></symbol>
+<symbol id="i-out" viewBox="0 0 16 16"><path d="M8 2.5v7M4.8 6.5L8 9.7l3.2-3.2M3 13h10"/></symbol>
+<symbol id="i-disk" viewBox="0 0 16 16"><path d="M3 3h8l2 2v8H3zM5.5 3v3h4.5V3M5.5 13v-3.5h5V13"/></symbol>
+<symbol id="i-in" viewBox="0 0 16 16"><path d="M8 13V6M4.8 9L8 5.8 11.2 9M3 3h10"/></symbol>
+<symbol id="i-pause" viewBox="0 0 16 16"><path d="M6 4v8M10 4v8"/></symbol>
+<symbol id="i-back" viewBox="0 0 16 16"><path d="M6 3.5L2.5 7 6 10.5M3 7h6.5a3.5 3.5 0 0 1 0 7H8"/></symbol>
+<symbol id="i-srv" viewBox="0 0 16 16"><path d="M6 2v3M10 2v3M4 5h8v3a4 4 0 0 1-8 0zM8 12v2.5"/></symbol>
+<symbol id="i-info" viewBox="0 0 16 16"><circle cx="8" cy="8" r="5.8"/><path d="M8 7.5V11M8 5h.01"/></symbol>
+<symbol id="i-key" viewBox="0 0 16 16"><circle cx="5.5" cy="10.5" r="3"/><path d="M7.6 8.4L13 3M11 5l1.6 1.6"/></symbol>
+</svg>
+
+<header class="top"><div class="wrap top-in">
+  <div class="brand">
+    <svg class="logo" viewBox="0 0 20 20" aria-hidden="true"><path d="M3 18V9a7 7 0 0 1 14 0v9M2 18h16M7 18v-8M10 18V7.5M13 18v-8"/></svg>
+    <h1>llama-gate</h1><span id="ver" class="mut n"></span><span id="mode"></span>
+  </div>
+  <div class="hmeta">
+    <span id="conn" class="conn t-muted" role="status"><i class="dot"></i><span id="conn-l">connecting…</span></span>
+    <span id="uptime" class="n mut"></span>
+    <span id="models" class="models"></span>
+    <button id="key-btn" class="btn ghost sm" type="button" hidden><svg class="ic" aria-hidden="true"><use href="#i-key"/></svg>API key</button>
+  </div>
+</div></header>
+
+<main class="wrap">
+<section id="auth" class="panel" aria-labelledby="auth-t" hidden>
+  <form id="auth-f" autocomplete="off">
+    <div class="auth-h"><svg class="ic" aria-hidden="true"><use href="#i-key"/></svg><strong id="auth-t">Admin API key</strong></div>
+    <p id="auth-m"></p>
+    <div class="auth-row">
+      <input id="auth-k" type="password" placeholder="admin API key" autocomplete="off" spellcheck="false" aria-labelledby="auth-t">
+      <button class="btn primary" type="submit">Save key</button>
+      <button id="auth-x" class="btn" type="button">Forget key</button>
+      <button id="auth-c" class="btn ghost" type="button">Close</button>
+    </div>
+    <p class="mut">Stored in this browser only, sent as <code>Authorization: Bearer …</code>.</p>
+  </form>
+</section>
+
+<section class="area-bk" aria-labelledby="h-bk">
+  <div class="sh"><h2 id="h-bk">Backends</h2><span id="bk-meta" class="pm"></span></div>
+  <div id="bk-note" class="note" hidden></div>
+  <div id="bk-grid" class="bk-grid"></div>
+</section>
+
+<section class="panel area-q" aria-labelledby="h-q">
+  <div class="ph"><h2 id="h-q">Queue</h2><span id="q-meta" class="pm"></span></div>
+  <div id="q-wrap" class="tblwrap" hidden><table class="tbl"><thead><tr><th class="r">#</th><th>Client</th><th>Class</th><th>Model</th><th class="r">Need</th><th class="r">Waited</th><th>Status</th></tr></thead><tbody id="q-tb"></tbody></table></div>
+  <div id="q-empty" class="empty"></div>
+</section>
+
+<section class="panel area-cl" aria-labelledby="h-cl">
+  <div class="ph"><h2 id="h-cl">Clients</h2><span id="cl-meta" class="pm"></span></div>
+  <div id="cl-wrap" class="tblwrap" hidden><table class="tbl"><thead><tr><th>Client</th><th class="r">Requests</th><th class="r">Prompt</th><th class="r">Cached</th><th class="r">Cache hit</th><th class="r">Generated</th><th class="r"><abbr title="Fairness counter (VTC): weighted tokens served so far. Among equal priorities, the lowest goes next.">Service</abbr></th><th class="r">Waiting</th><th class="r">Running</th></tr></thead><tbody id="cl-tb"></tbody></table></div>
+  <div id="cl-empty" class="empty"></div>
+</section>
+
+<section class="panel area-rc" aria-labelledby="h-rc">
+  <div class="ph"><h2 id="h-rc">Recent requests</h2><span id="rc-meta" class="pm"></span></div>
+  <div id="rc-wrap" class="scroll" hidden><table class="tbl"><thead><tr><th>Time</th><th>Client</th><th>Model</th><th>Slot</th><th>Result</th><th class="r">Prompt</th><th class="r">Cached</th><th class="r">Gen</th><th class="r"><abbr title="Measuring the prompt with the server's tokenizer">Measure</abbr></th><th class="r">Queue</th><th class="r"><abbr title="Time to first token">TTFT</abbr></th><th class="r">Total</th><th class="r">tok/s</th><th></th></tr></thead><tbody id="rc-tb"></tbody></table></div>
+  <div id="rc-empty" class="empty"></div>
+</section>
+
+<section class="panel area-fd" aria-labelledby="h-fd">
+  <div class="ph"><h2 id="h-fd">Live feed</h2><span id="fd-meta" class="pm"></span><button id="fd-pause" class="btn ghost sm" type="button" aria-pressed="false">Pause</button></div>
+  <ol id="fd-list" class="feed" aria-label="Events, newest first" hidden></ol>
+  <div id="fd-empty" class="empty"></div>
+</section>
+</main>
+<div id="tip" class="tip" role="tooltip" hidden></div>
+
+<script>
+(() => {
+'use strict';
+const Q = new URLSearchParams(location.search), DEMO = Q.has('demo');
+// Served at {prefix}/ or {prefix}/dashboard; the API is beside it.
+const BASE = location.pathname.replace(/\/+$/, '').replace(/\/(index\.html|dashboard(\.html)?)$/, '').replace(/\/+$/, '');
+const KEY = 'llama-gate.admin-key';
+const $ = id => document.getElementById(id);
+
+/* ---------- formatting ---------- */
+const arr = v => Array.isArray(v) ? v : [];
+const num = v => typeof v === 'number' && isFinite(v) ? v : null;
+const esc = v => String(v ?? '').replace(/[&<>"']/g, c => '&#' + c.charCodeAt(0) + ';');
+const one = x => x.toFixed(1).replace(/\.0$/, '');
+const fTok = n => { n = num(n); if (n == null) return '—'; const a = Math.abs(n); return a < 1e3 ? String(Math.round(n)) : a < 999950 ? one(n / 1e3) + 'k' : one(n / 1e6) + 'M'; };
+const fBytes = b => { b = num(b); if (b == null) return '—'; for (const [d, u] of [[1e9, 'GB'], [1e6, 'MB'], [1e3, 'KB']]) if (b >= d) { const v = b / d; return (v < 100 ? one(v) : Math.round(v)) + ' ' + u; } return Math.round(b) + ' B'; };
+const fDur = ms => { ms = num(ms); if (ms == null) return '—'; ms = Math.max(0, ms); if (ms < 1e3) return Math.round(ms) + ' ms'; const s = ms / 1e3; if (s < 60) return s.toFixed(1) + ' s'; const m = s / 60; return (m < 10 ? m.toFixed(1) : Math.round(m)) + ' min'; };
+const fUp = ms => { let s = Math.floor(ms / 1e3); const d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600), m = Math.floor(s % 3600 / 60); s %= 60; return d ? `${d}d ${h}h` : h ? `${h}h ${m}m` : m ? `${m}m ${s}s` : `${s}s`; };
+const p2 = n => String(n).padStart(2, '0');
+const fClock = w => { if (w == null) return '—'; const d = new Date(w); return `${p2(d.getHours())}:${p2(d.getMinutes())}:${p2(d.getSeconds())}`; };
+const fInt = n => (n = num(n)) == null ? '—' : Math.round(n).toLocaleString('en-US');
+const fPct = x => (x = num(x)) == null ? '—' : (x * 100).toFixed(1) + '%';
+const plural = (n, w) => `${n} ${w}${n === 1 ? '' : 's'}`;
+const dash = '<span class="mut">—</span>';
+const td = (v, c, t) => `<td${c ? ` class="${c}"` : ''}${t ? ` title="${esc(t)}"` : ''}>${v}</td>`;
+const tn = (v, t) => td(v, 'r n', t);
+const badge = (tone, label, title, dot = 'dot') => `<span class="badge t-${tone}"${title ? ` title="${esc(title)}"` : ''}><i class="${dot}"></i>${label}</span>`;
+
+/* ---------- state ---------- */
+const S = {st: null, at: 0, anchor: null, key: '', authMsg: '',
+  fails: 0, err: '', ev: 'connecting', evErr: '', evTry: 0, ev401: 0, pend: []};
+try { S.key = localStorage.getItem(KEY) || ''; } catch (e) { /* storage blocked: memory only */ }
+const setKey = k => { S.key = k; try { if (k) localStorage.setItem(KEY, k); else localStorage.removeItem(KEY); } catch (e) { /* memory only */ } };
+const hdrs = accept => S.key ? {Accept: accept, Authorization: 'Bearer ' + S.key} : {Accept: accept};
+const put = (el, h) => { if (el._h !== h) { el._h = h; el.innerHTML = h; } };
+const txt = (el, t) => { if (el.textContent !== t) el.textContent = t; };
+// at_ms counts from the gate's start; uptime_ms anchors it to the wall clock.
+const wall = at => (at = num(at)) != null && S.anchor != null ? S.anchor + at : null;
+// Names expected; numeric ids and {backend, index} slot ids tolerated.
+const bName = v => { if (v && typeof v === 'object') v = v.backend ?? v.id; if (typeof v === 'number') { const b = arr(S.st?.backends).find(x => x && (x.id ?? x.backend) === v); return b?.name ?? String(v); } return v ?? '?'; };
+const sNum = v => v && typeof v === 'object' ? v.index : v;
+const sIdx = (s, i) => sNum(s.index ?? s.slot) ?? i;
+const mName = v => { if (typeof v === 'number') { const m = arr(S.st?.models).find(x => x && x.id === v); return m?.name ?? String(v); } return v ?? '—'; };
+const at = (b, s) => esc(bName(b)) + (s != null ? '/' + esc(sNum(s)) : '');
+const isUp = b => b.up ?? b.online;
+const capOf = b => num(b.capacity) ?? num(b.layout?.capacity) ?? (num(b.layout?.per_slot) || 0) * arr(b.slots).length;
+const known = () => S.st && S.st.ready !== false;
+const usageOf = b => num(b.usage) ?? arr(b.slots).reduce((a, s) => a + (num(s?.tokens) || 0), 0) + (num(b.stray) || 0);
+
+/* ---------- status polling, once a second ---------- */
+let pGen = 0, pTimer = 0;
+function startPoll() { clearTimeout(pTimer); poll(++pGen); }
+async function poll(gen) {
+  const t0 = Date.now();
+  let next = 1000;
+  try {
+    const ctl = new AbortController(), to = setTimeout(() => ctl.abort(), 6000);
+    let r;
+    try { r = await fetch(BASE + '/status', {headers: hdrs('application/json'), cache: 'no-store', signal: ctl.signal}); } finally { clearTimeout(to); }
+    if (gen !== pGen) return;
+    if (r.status === 401 || r.status === 403) { unauthorized(r.status); next = 15000; }
+    else if (!r.ok) throw new Error('HTTP ' + r.status);
+    else {
+      const j = await r.json();
+      if (gen !== pGen) return;
+      S.fails = 0; S.err = '';
+      if (S.unauth || S.authTry) { S.unauth = S.authTry = false; showAuth(false); }
+      if (S.ev === 'unauthorized' && Date.now() - S.ev401 > 15000) startEvents(); // retry a refused stream, at most every 15 s
+      applyStatus(j);
+      next = Math.max(100, 1000 - (Date.now() - t0));
+    }
+  } catch (e) {
+    if (gen !== pGen) return;
+    S.fails++;
+    S.err = e.name === 'AbortError' ? 'timed out' : e.message || 'network error';
+    next = Math.min(10000, 1000 * 2 ** Math.min(S.fails - 1, 4));
+  }
+  if (document.hidden) next = Math.max(next, 5000);
+  renderConn(); renderNote(); renderEmpty();
+  pTimer = setTimeout(() => poll(gen), next);
+}
+
+/* ---------- event stream: fetch, not EventSource, so it can send the key ---------- */
+let eGen = 0, eCtl = null, eTimer = 0;
+function startEvents() { clearTimeout(eTimer); if (eCtl) eCtl.abort(); S.evTry = 0; stream(++eGen); }
+async function stream(gen) {
+  const ctl = new AbortController();
+  eCtl = ctl;
+  let dog = 0;
+  const arm = () => { clearTimeout(dog); dog = setTimeout(() => ctl.abort(), 75000); }; // gate pings every 15 s
+  setEv(S.evTry ? 'reconnecting' : 'connecting');
+  try {
+    arm();
+    const r = await fetch(BASE + '/events', {headers: hdrs('text/event-stream'), cache: 'no-store', signal: ctl.signal});
+    if (r.status === 401 || r.status === 403) { clearTimeout(dog); if (gen === eGen) { S.ev401 = Date.now(); setEv('unauthorized'); unauthorized(r.status); } return; }
+    if (!r.ok || !r.body) throw new Error('HTTP ' + r.status);
+    setEv('live');
+    const rd = r.body.getReader(), dec = new TextDecoder();
+    let buf = '', data = [];
+    for (;;) {
+      const {value, done} = await rd.read();
+      if (done) break;
+      arm(); S.evTry = 0;
+      buf += dec.decode(value, {stream: true});
+      let i;
+      while ((i = buf.indexOf('\n')) >= 0) {
+        let line = buf.slice(0, i);
+        buf = buf.slice(i + 1);
+        if (line.endsWith('\r')) line = line.slice(0, -1);
+        if (!line) { if (data.length) { onData(data.join('\n')); data = []; } continue; } // end of event
+        if (line[0] === ':') continue; // keepalive comment
+        const c = line.indexOf(':');
+        if ((c < 0 ? line : line.slice(0, c)) !== 'data') continue;
+        const v = c < 0 ? '' : line.slice(c + 1);
+        data.push(v[0] === ' ' ? v.slice(1) : v);
+      }
+    }
+    throw new Error('closed');
+  } catch (e) {
+    clearTimeout(dog);
+    if (gen !== eGen) return;
+    S.evTry++;
+    S.evErr = e.name === 'AbortError' ? 'stalled' : e.message || 'network error';
+    const missing = /HTTP 404/.test(S.evErr);
+    setEv(missing ? 'unavailable' : 'reconnecting');
+    eTimer = setTimeout(() => stream(gen), missing ? 60000 : Math.min(30000, 1000 * 2 ** Math.min(S.evTry - 1, 5)) * (0.8 + Math.random() * 0.4));
+  }
+}
+function setEv(s) { S.ev = s; renderConn(); renderFeedMeta(); }
+function onData(t) { let ev; try { ev = JSON.parse(t); } catch (e) { return; } onEvent(ev); }
+
+/* ---------- auth ---------- */
+function unauthorized(code) {
+  if (!S.unauth || S.authTry) showAuth(true, true);
+  S.unauth = true; S.authTry = false;
+  S.authMsg = S.key ? `The gate rejected the saved key (${code}).` : `The gate answered ${code}: it needs the admin API key.`;
+  renderAuth(); renderConn(); renderNote(); renderFeedMeta();
+}
+function renderAuth() {
+  txt($('auth-t'), S.unauth ? 'Unauthorized' : 'Admin API key');
+  txt($('auth-m'), S.authTry ? 'Checking the key…' : S.unauth ? S.authMsg
+    : S.key ? 'A key is saved in this browser. Enter a new one to replace it.' : 'No key saved. One is needed only when the gate has admin keys.');
+}
+function showAuth(on, focus) {
+  $('auth').hidden = !on;
+  renderAuth();
+  if (on && focus) $('auth-k').focus({preventScroll: true});
+}
+function restart() { startPoll(); startEvents(); renderConn(); }
+$('auth-f').addEventListener('submit', e => {
+  e.preventDefault();
+  const k = $('auth-k').value.trim();
+  if (!k) return $('auth-k').focus();
+  setKey(k); $('auth-k').value = '';
+  S.authTry = true; renderAuth(); restart();
+});
+$('auth-x').onclick = () => { setKey(''); $('auth-k').value = ''; S.authTry = false; renderAuth(); restart(); };
+$('auth-c').onclick = () => showAuth(false);
+$('key-btn').onclick = () => showAuth($('auth').hidden, true);
+
+/* ---------- rendering ---------- */
+function applyStatus(j) {
+  if (!j || typeof j !== 'object') return;
+  S.st = j; S.at = Date.now();
+  const up = num(j.uptime_ms);
+  if (up != null) { const a = S.at - up; if (S.anchor == null || Math.abs(a - S.anchor) > 2000) S.anchor = a; }
+  renderHeader(); renderBackends(); renderQueue(); renderClients(); renderRecent(); renderConn();
+  if (tipK) showTip(tipK, tipX, tipY);
+}
+
+const MODES = {enforce: ['good', 'The gate admits, queues and places requests'], observe: ['warn', 'Shadow mode: decisions are only logged'], bypass: ['serious', 'Requests pass straight through']};
+function renderHeader() {
+  const st = S.st || {}, m = st.mode, md = MODES[m] || ['muted', 'mode'];
+  txt($('ver'), st.version ? 'v' + st.version : '');
+  put($('mode'), m ? badge(md[0], esc(m), md[1]) : '');
+  put($('models'), arr(st.models).filter(Boolean).map(m => {
+    const name = m.name ?? m.id, al = arr(m.aliases), bs = arr(m.backends).map(bName);
+    const tip = [`model ${name}`, al.length && 'aliases: ' + al.join(', '), bs.length && 'served by: ' + bs.join(', ')].filter(Boolean).join('\n');
+    return `<span class="chip" title="${esc(tip)}">${esc(name)}</span>`;
+  }).join(''));
+  renderUptime();
+}
+function renderUptime() { const u = num(S.st?.uptime_ms); txt($('uptime'), u == null ? '' : 'up ' + fUp(u + (S.fails || S.unauth ? 0 : Date.now() - S.at))); }
+
+function renderConn() {
+  const age = S.at ? Date.now() - S.at : Infinity;
+  let c;
+  if (DEMO) c = ['violet', 'demo', 'simulated data'];
+  else if (S.unauth) c = ['bad', 'unauthorized', S.authMsg];
+  else if (!S.st && !S.fails) c = ['muted', 'connecting…', ''];
+  else if (S.fails || age > 4000) c = ['warn', 'reconnecting…', `status: ${S.err || 'no answer'}`];
+  else if (S.ev === 'connecting') c = ['muted', 'connecting…', 'opening the event stream'];
+  else if (S.ev === 'reconnecting') c = ['warn', 'reconnecting…', `event stream: ${S.evErr}`];
+  else c = ['good', 'live', S.ev === 'live' ? 'status and event stream connected' : 'status connected; no event stream'];
+  const el = $('conn');
+  el.className = 'conn t-' + c[0]; el.title = c[2];
+  txt($('conn-l'), c[1]);
+  document.body.classList.toggle('stale', !DEMO && !!S.st && (S.unauth || S.fails > 0 || age > 4000));
+}
+
+const note = (tone, title, body, busy) => `<div class="note-in t-${tone}"><i class="dot${busy ? ' pulse' : ''}"></i><div><strong>${esc(title)}</strong><p>${esc(body)}</p></div></div>`;
+function renderNote() {
+  const st = S.st, el = $('bk-note');
+  const h = DEMO ? '' : S.unauth && !st ? note('bad', 'Locked', 'Enter the admin API key above.')
+    : !st && S.fails ? note('warn', `Can't reach ${BASE}/status`, `${S.err}. Retrying…`, true)
+    : !st ? note('muted', 'Connecting…', 'Loading the gate status.', true)
+    : st.ready === false ? note('warn', 'Waiting for backends', 'No llama-server has answered yet; this page updates by itself.', true)
+    : arr(st.backends).length ? '' : note('muted', 'No backends', 'The status lists no backends.');
+  put(el, h); el.hidden = !h;
+}
+// Empty states claim "nothing here" only once a status has arrived.
+const EMPTY = {q: ['Nobody is waiting', 'Every request was admitted.'], cl: ['No clients yet', ''], rc: ['No finished requests yet', '']};
+function renderEmpty() {
+  for (const k in EMPTY) {
+    const [a, b] = known() ? EMPTY[k] : ['No data yet', S.unauth ? 'Needs the admin API key.' : S.st ? 'Waiting for backends.' : 'Waiting for the status.'];
+    put($(k + '-empty'), `<strong>${a}</strong>${b}`);
+  }
+}
+
+/* backends */
+const cards = new Map();
+const STATES = ['running', 'preparing', 'preempting', 'evicting', 'idle', 'faulted'];
+const FLAGS = [['swap', 'swap', 'Idle contexts are saved to disk, not recomputed'], ['partial_reuse', 'partial reuse', 'Contexts sharing part of a prompt are reused'],
+  ['incremental', 'incremental', 'Only the new turn of a prompt is tokenized']];
+function renderBackends() {
+  const list = arr(S.st?.backends).filter(b => b && typeof b === 'object'), grid = $('bk-grid'), seen = new Set();
+  list.forEach((b, i) => {
+    const k = String(b.id ?? b.backend ?? b.name ?? i);
+    seen.add(k);
+    let c = cards.get(k);
+    if (!c) { c = makeCard(k); cards.set(k, c); }
+    if (grid.children[i] !== c) grid.insertBefore(c, grid.children[i] || null);
+    fillCard(c, b);
+  });
+  for (const [k, c] of cards) if (!seen.has(k)) { c.remove(); cards.delete(k); }
+  const ups = list.filter(b => isUp(b) !== false).length;
+  txt($('bk-meta'), list.length ? `${plural(list.length, 'backend')} · ${ups} up` : '');
+  renderNote();
+}
+function makeCard(k) {
+  const c = document.createElement('article');
+  c.className = 'panel bk';
+  c.dataset.k = k;
+  c.innerHTML = '<div></div><div class="kv-h"></div><div class="kv" role="group"></div><div class="lg"></div><div class="tblwrap"><table class="tbl"><thead><tr>'
+    + '<th class="r">#</th><th>State</th><th>Client</th><th>Class</th><th class="r">Tokens</th><th class="r">Running</th>'
+    + '<th><abbr title="Has output started? Until it has, the request can still be paused.">Output</abbr></th>'
+    + '<th class="r"><abbr title="Prompt tokens expected from the slot\'s cache">Reuse</abbr></th></tr></thead><tbody></tbody></table></div><div class="bk-f"></div>';
+  const [h, kh, bar, lg, , f] = c.children;
+  c._ = {h, kh, bar, lg, tb: c.querySelector('tbody'), f};
+  return c;
+}
+function fillCard(c, b) {
+  c._b = b;
+  const P = c._, up = isUp(b), kind = b.layout?.kind || 'unified', split = kind === 'split', per = num(b.layout?.per_slot);
+  const slots = arr(b.slots), cap = capOf(b), stray = Math.max(0, num(b.stray) || 0), usage = usageOf(b);
+  c.classList.toggle('down', up === false);
+  put(P.h, `<div class="bk-t"><h3>${esc(b.name ?? 'backend ' + (b.id ?? ''))}</h3>${up === false ? badge('bad', 'down') : up ? badge('good', 'up') : badge('muted', 'unknown')}<span class="model">${esc(mName(b.model))}</span></div>`
+    + `<div class="bk-m">${b.url ? `<span class="url n">${esc(b.url)}</span>` : ''}<span class="badge t-muted" title="${split ? 'Each slot owns a fixed share of the KV cache' : 'One KV pool shared by every slot'}">${esc(kind)}${split && per != null ? ' · ' + fTok(per) + ' per slot' : ''}</span>`
+    + FLAGS.filter(([f]) => b[f] === true).map(([, l, t]) => `<span class="badge t-muted" title="${t}">${l}</span>`).join('') + '</div>');
+  put(P.kh, `<span class="kv-l">KV pool</span><span class="kv-p">${cap > 0 ? fPct(usage / cap) : '—'}</span>${up === false ? '<span class="kv-off">offline</span>' : ''}<span class="kv-u n">${fTok(usage)} / ${fTok(cap)} tokens</span>`);
+  P.bar.setAttribute('aria-label', `KV pool of ${b.name ?? 'backend'}: ${fTok(usage)} of ${fTok(cap)} tokens in use`);
+  renderBar(c, b, slots, cap, stray, split);
+  const agg = {};
+  for (const s of slots) { const st = s?.state; if (st && st !== 'empty') agg[st] = (agg[st] || 0) + (num(s.tokens) || 0); }
+  const li = (cls, label, n) => `<span class="li"><i class="sw ${cls}"></i>${esc(label)} <span class="n">${fTok(n)}</span></span>`;
+  put(P.lg, [...STATES.filter(s => s in agg), ...Object.keys(agg).filter(s => !STATES.includes(s))].map(s => li('k-' + esc(s), s, agg[s])).join('')
+    + (stray ? li('k-stray', split ? 'stray (not drawn)' : 'stray', stray) : '') + li('k-free', 'free', Math.max(0, cap - usage)));
+  put(P.tb, slots.map((s, i) => slotRow(s || {}, i)).join('') || '<tr><td colspan="8" class="mut">No slots reported.</td></tr>');
+  const sn = b.snapshots, so = sn && typeof sn === 'object', cnt = so ? num(sn.count) : num(sn), bytes = so ? num(sn.bytes) : num(b.snapshot_bytes);
+  put(P.f, `<span>Snapshots <b class="n">${cnt ?? 0}</b>${cnt && bytes != null ? ` · <span class="n">${fBytes(bytes)}</span>` : ''}${b.swap === false && !cnt ? ' <span class="mut">· swap off</span>' : ''}</span>`
+    + (b.build ? `<span class="mut">build <span class="n">${esc(b.build)}</span></span>` : ''));
+}
+function slotRow(s, i) {
+  const st = s.state || 'empty', run = num(s.running_ms) ?? num(s.running_for);
+  const out = s.started === true ? 'started' : s.started === false ? 'not yet' + (s.pausable ? ' <span class="mut">· pausable</span>' : '') : dash;
+  return `<tr${st === 'empty' ? ' class="dim"' : ''}>${tn(esc(sIdx(s, i)))}${td(`<span class="stt"><i class="sw k-${esc(st)}"></i>${esc(st)}</span>`)}`
+    + td(s.client != null ? esc(s.client) : dash, '', s.ticket != null && 'ticket #' + s.ticket) + td(s.class != null ? esc(s.class) : dash)
+    + tn(fTok(num(s.tokens) ?? 0)) + tn(run != null ? fDur(run) : dash) + td(out) + tn(num(s.reuse) != null ? fTok(s.reuse) : dash) + '</tr>';
+}
+// The hero bar; segments update in place so hover and transitions survive refreshes.
+function renderBar(c, b, slots, cap, stray, split) {
+  const bar = c._.bar, n = slots.length, sig = (split ? 's' : 'u') + n;
+  if (bar._sig !== sig) {
+    const k = esc(c.dataset.k);
+    let h = '';
+    for (let i = 0; i < n; i++) h += split ? `<div class="box" tabindex="0" data-k="${k}|${i}"><div class="seg"><span></span></div></div>` : `<div class="seg" tabindex="0" data-k="${k}|${i}"><span></span></div>`;
+    if (!split) h += `<div class="seg k-stray" tabindex="0" data-k="${k}|stray"><span></span></div><div class="seg k-free" tabindex="0" data-k="${k}|free"><span></span></div>`;
+    bar._sig = sig; bar.className = 'kv' + (split ? ' split' : ''); bar.innerHTML = h;
+  }
+  const W = bar.clientWidth || 600, per = split ? num(b.layout?.per_slot) || cap / Math.max(1, n) : 0;
+  const fit = (px, short, long) => px >= long.length * 6.7 + 14 ? long : px >= short.length * 6.7 + 12 ? short : '';
+  const total = split ? 0 : Math.max(cap, slots.reduce((a, s) => a + Math.max(0, num(s?.tokens) || 0), 0) + stray) || 1;
+  const now = [...bar.children].map(h => (split ? h.firstChild : h).offsetWidth); // as drawn, even mid-transition
+  slots.forEach((s, i) => {
+    s = s || {};
+    const host = bar.children[i], seg = split ? host.firstChild : host, tok = Math.max(0, num(s.tokens) || 0), st = s.state || 'empty';
+    const f = split ? Math.min(1, per ? tok / per : 0) : tok / total, idx = String(sIdx(s, i));
+    seg.className = 'seg k-' + st + (tok > 0 ? '' : ' z');
+    seg.style.width = (f * 100).toFixed(3) + '%';
+    txt(seg.firstChild, tok > 0 ? fit(Math.min(now[i], f * (split ? (W - 2 * (n - 1)) / n : W)), idx, `${idx} · ${s.client ?? st}`) : '');
+    host.setAttribute('aria-label', `slot ${idx}: ${st}${s.client != null ? ', ' + s.client : ''}, ${fTok(tok)} tokens`);
+  });
+  if (split) return;
+  const sg = bar.children[n], fr = bar.children[n + 1], free = Math.max(0, cap - usageOf(b));
+  sg.classList.toggle('z', !stray);
+  sg.style.width = (stray / total * 100).toFixed(3) + '%';
+  sg.setAttribute('aria-label', `stray: ${fTok(stray)} tokens`);
+  fr.setAttribute('aria-label', `free: ${fTok(free)} tokens`);
+  txt(fr.firstChild, fit(Math.min(now[n + 1], free / total * W), fTok(free), 'free ' + fTok(free)));
+}
+
+/* queue, clients, recent */
+function show(k, rows, n) { put($(k + '-tb'), rows); $(k + '-wrap').hidden = !n; $(k + '-empty').hidden = !!n; renderEmpty(); }
+function renderQueue() {
+  const w = arr(S.st?.waiting).filter(Boolean), waited = r => num(r.waited_ms) ?? num(r.waited);
+  const need = w.reduce((a, r) => a + (num(r.need) || 0), 0), oldest = w.reduce((a, r) => Math.max(a, waited(r) || 0), 0);
+  txt($('q-meta'), w.length ? `${w.length} waiting · ${fTok(need)} needed · oldest ${fDur(oldest)}` : known() ? 'empty' : '');
+  show('q', w.map((r, i) => {
+    const n = num(r.bumped) || 0;
+    const tags = (r.paused ? badge('serious', 'stopping…', '', 'dot pulse') : '') + (n > 0 ? badge('warn', `paused ${n}×`) : '');
+    return `<tr>${tn(i + 1)}${td(esc(r.client ?? '?') + (r.ticket != null ? ` <span class="mut n">#${esc(r.ticket)}</span>` : ''))}${td(esc(r.class ?? '—'))}${td(esc(mName(r.model)))}`
+      + `${tn(fTok(r.need))}${tn(fDur(waited(r)))}${td(tags || dash)}</tr>`;
+  }).join(''), w.length);
+}
+function renderClients() {
+  const cl = arr(S.st?.clients).filter(Boolean).sort((a, b) => String(a.name).localeCompare(String(b.name)));
+  const top = Math.max(1, ...cl.map(c => num(c.service) || 0));
+  const meter = (f, cls) => `<span class="meter${cls}"><i style="width:${(Math.max(0, f) * 100).toFixed(1)}%"></i></span>`;
+  txt($('cl-meta'), cl.length ? plural(cl.length, 'client') : '');
+  show('cl', cl.map(c => {
+    const p = num(c.prompt_tokens) || 0, k = num(c.cached_tokens) || 0, hit = p > 0 ? Math.min(1, k / p) : null, sv = num(c.service), wn = num(c.waiting) || 0, rn = num(c.running) || 0;
+    return `<tr>${td(esc(c.name ?? '?'))}${tn(fInt(c.requests))}${tn(fTok(p))}${tn(fTok(k))}${tn(meter(hit || 0, '') + fPct(hit))}${tn(fTok(c.generated_tokens))}`
+      + `${tn(meter((sv || 0) / top, ' svc') + fTok(sv))}${td(fInt(wn), wn ? 'r n' : 'r n mut')}${td(fInt(rn), rn ? 'r n' : 'r n mut')}</tr>`;
+  }).join(''), cl.length);
+}
+const OUT = {ok: 'good', error: 'bad', cancelled: 'muted', refused: 'warn'};
+function renderRecent() {
+  const rc = arr(S.st?.recent).filter(Boolean).sort((a, b) => (num(b.at_ms) ?? 0) - (num(a.at_ms) ?? 0) || (num(b.ticket) ?? 0) - (num(a.ticket) ?? 0)).slice(0, 50);
+  txt($('rc-meta'), rc.length ? `last ${rc.length}` : '');
+  show('rc', rc.map(r => {
+    const o = r.outcome || (num(r.status) >= 400 ? 'error' : 'ok'), w = wall(r.at_ms), tps = num(r.tokens_per_second), pre = num(r.preempted) || 0, bn = num(r.bounced) || 0;
+    const tags = (pre > 0 ? badge('serious', `paused ${pre}×`) : '') + (bn > 0 ? badge('magenta', `bounced ${bn}×`) : '');
+    return `<tr>${td(fClock(w), 'n mut', w && new Date(w).toLocaleString())}${td(esc(r.client ?? '?'))}${td(esc(mName(r.model)), '', r.dialect)}${td(r.backend != null ? at(r.backend, r.slot) : dash, 'n')}`
+      + td(badge(OUT[o] || 'muted', esc(o) + (r.status != null ? ` <span class="n mut">${esc(r.status)}</span>` : '')))
+      + `${tn(fTok(r.prompt))}${tn(fTok(r.cached), num(r.prompt) > 0 && num(r.cached) != null && fPct(r.cached / r.prompt) + ' cached')}${tn(fTok(r.generated))}`
+      + `${tn(fDur(r.measure_ms))}${tn(fDur(r.queue_ms))}${tn(fDur(r.ttft_ms))}${tn(fDur(r.total_ms))}${tn(tps != null ? tps.toFixed(1) : '—')}${td(tags)}</tr>`;
+  }).join(''), rc.length);
+}
+
+/* ---------- live feed ---------- */
+let fTimer = 0;
+function onEvent(ev) {
+  if (!ev || typeof ev !== 'object' || Array.isArray(ev)) return;
+  ev._w = wall(ev.at_ms) ?? Date.now();
+  S.pend.push(ev);
+  if (S.pend.length > 400) S.pend.splice(0, S.pend.length - 200);
+  if (S.paused) return renderFeedMeta();
+  if (!fTimer) fTimer = setTimeout(flushFeed, 60);
+}
+function flushFeed() {
+  fTimer = 0;
+  if (S.paused || !S.pend.length) return renderFeedMeta();
+  const items = S.pend.splice(0).slice(-200), list = $('fd-list'), frag = document.createDocumentFragment(), fresh = S.flushed && items.length < 20;
+  for (let i = items.length - 1; i >= 0; i--) {
+    const ev = items[i], li = document.createElement('li');
+    let d;
+    try { d = describe(ev); } catch (e) { d = ['muted', 'info', esc(ev.type ?? 'event')]; }
+    li.className = `ev t-${d[0]}${fresh ? ' fresh' : ''}`;
+    li.innerHTML = `<time class="n">${fClock(ev._w)}</time><svg class="ic" aria-hidden="true"><use href="#i-${d[1]}"/></svg><span>${d[2]}</span>`;
+    frag.appendChild(li);
+  }
+  list.prepend(frag);
+  while (list.childElementCount > 200) list.lastElementChild.remove();
+  S.flushed = true;
+  renderFeedMeta();
+}
+// One short sentence per event: [tone, icon, html].
+function describe(e) {
+  const B = v => `<b>${esc(v ?? '?')}</b>`, who = e.client, where = at(e.backend, e.slot), tok = n => fTok(num(n) ?? 0);
+  switch (e.type) {
+    case 'dispatch': {
+      const w = num(e.waited_ms) || 0;
+      return ['accent', 'go', `dispatch ${B(who)} → ${where} (need ${tok(e.need)}, reuse ${tok(e.reuse)}${w >= 100 ? ', waited ' + fDur(w) : ''})`];
+    }
+    case 'finish': {
+      const o = e.outcome || 'ok', on = e.backend != null ? ' on ' + where : '';
+      if (o === 'ok') return ['good', 'ok', `finished ${B(who)}${on}: ${tok(e.prompt)} prompt (${tok(e.cached)} cached), ${tok(e.generated)} generated in ${fDur(e.total_ms)}${num(e.tokens_per_second) ? `, ${e.tokens_per_second.toFixed(1)} tok/s` : ''}`];
+      if (o === 'cancelled') return ['muted', 'x', `cancelled ${B(who)}${on} after ${fDur(e.total_ms)}, ${tok(e.generated)} generated`];
+      if (o === 'refused') return ['warn', 'x', `refused ${B(who)}${e.status != null ? ' (' + esc(e.status) + ')' : ''}`];
+      return ['bad', 'x', `${esc(o)} for ${B(who)}${on}${e.status != null ? ', status ' + esc(e.status) : ''} after ${fDur(e.total_ms)}`];
+    }
+    case 'reject':
+      return ['serious', 'x', `rejected ${B(who)}: ${esc(String(e.reason ?? 'refused').replace(/_/g, ' '))}${e.status != null ? ' (' + esc(e.status) + ')' : ''}`];
+    case 'evict':
+      if (e.outcome === 'saved') return ['warn', 'out', `saved idle context ${where}: ${tok(e.tokens)} tokens, ${fBytes(e.bytes)} in ${fDur(e.ms)}`];
+      if (e.outcome === 'erased') return ['muted', 'out', `erased idle context ${where}: ${tok(e.tokens)} tokens freed`];
+      return ['bad', 'out', `could not evict ${where} (${tok(e.tokens)} tokens): ${esc(e.outcome ?? 'failed')}`];
+    case 'save':
+      return e.outcome === 'failed' ? ['bad', 'disk', `failed to save a snapshot of ${where}`]
+        : ['violet', 'disk', `saved snapshot of ${where}: ${tok(e.tokens)} tokens${num(e.bytes) != null ? ', ' + fBytes(e.bytes) : ''} in ${fDur(e.ms)}`];
+    case 'restore':
+      return e.outcome === 'failed' ? ['bad', 'in', `restore into ${where} failed; recomputing`]
+        : ['aqua', 'in', `restored context into ${where}: ${tok(e.tokens)} tokens in ${fDur(e.ms)}`];
+    case 'preempt':
+      return e.outcome === 'declined' ? ['muted', 'pause', `pause of ${B(who)} on ${where} declined`] : ['serious', 'pause', `paused ${B(who)} on ${where} to make room`];
+    case 'bounce':
+      return ['magenta', 'back', `${who != null ? B(who) + ' ' : ''}<span class="n">#${esc(e.ticket)}</span> bounced off ${esc(bName(e.backend))}, back in the queue`];
+    case 'backend':
+      return [{up: 'good', down: 'bad'}[e.state] || 'warn', 'srv', `backend ${B(bName(e.backend))} ${{up: 'is up', down: 'is down'}[e.state] || esc(e.state ?? 'changed')}`];
+    case 'notice':
+      return ['muted', 'info', esc(e.message ?? '')];
+    default: {
+      const {type, at_ms, _w, ...rest} = e;
+      return ['muted', 'info', `${esc(type ?? 'event')} <span class="mut n">${esc(JSON.stringify(rest).slice(0, 200))}</span>`];
+    }
+  }
+}
+function renderFeedMeta() {
+  const n = $('fd-list').childElementCount, bits = [], e = $('fd-empty');
+  if (n) bits.push(plural(n, 'event'));
+  if (S.paused) bits.push(S.pend.length ? `paused, ${S.pend.length} new` : 'paused');
+  if (!DEMO && S.ev === 'reconnecting') bits.push('reconnecting…');
+  txt($('fd-meta'), bits.join(' · '));
+  $('fd-list').hidden = !n; e.hidden = !!n;
+  txt(e, {unauthorized: 'The event stream needs the admin API key.', unavailable: 'No event stream here (404).', reconnecting: 'Disconnected; reconnecting…'}[S.ev] || 'Waiting for events…');
+}
+$('fd-pause').onclick = function () {
+  S.paused = !S.paused;
+  this.setAttribute('aria-pressed', String(S.paused));
+  this.textContent = S.paused ? 'Resume' : 'Pause';
+  if (S.paused) renderFeedMeta(); else flushFeed();
+};
+
+/* ---------- KV bar tooltip: hover, tap or focus ---------- */
+const tip = $('tip');
+let tipK = null, tipX = 0, tipY = 0, tipPin = false;
+function tipHTML(k) {
+  const j = k.lastIndexOf('|'), b = cards.get(k.slice(0, j))?._b, part = k.slice(j + 1);
+  if (!b) return '';
+  const cap = capOf(b), head = (cls, label, sub) => `<div class="tt-h"><i class="sw ${cls}"></i>${esc(label)}<span>${sub}</span></div>`, name = esc(b.name ?? '');
+  if (part === 'free') { const f = Math.max(0, cap - usageOf(b)); return head('k-free', 'free', name) + `<b>${fTok(f)} tokens</b>${cap ? fPct(f / cap) + ' of ' + fTok(cap) : ''}`; }
+  if (part === 'stray') return head('k-stray', 'stray', name) + `<b>${fTok(b.stray)} tokens</b>Left by an unpinned request in a slot the server chose; counted until that slot is erased.`;
+  const s = arr(b.slots)[+part];
+  if (!s) return '';
+  const st = s.state || 'empty', run = num(s.running_ms) ?? num(s.running_for), tk = num(s.tokens) ?? 0, per = b.layout?.kind === 'split' ? num(b.layout.per_slot) : null;
+  let h = head('k-' + esc(st), st, `${name} / slot ${esc(sIdx(s, +part))}`) + `<b>${fTok(tk)} tokens</b><div>${per ? fPct(tk / per) + ' of the slot' : cap ? fPct(tk / cap) + ' of the pool' : ''}</div>`;
+  if (s.client != null) h += `<div>${esc(s.client)}${s.class != null ? ' · ' + esc(s.class) : ''}${s.ticket != null ? ' · #' + esc(s.ticket) : ''}</div>`;
+  if (run != null) h += `<div>running ${fDur(run)} · ${s.started === false ? 'no output yet' + (s.pausable ? ', can still be paused' : '') : 'output started'}</div>`;
+  if (num(s.reuse) != null) h += `<div>expected cache reuse ${fTok(s.reuse)}</div>`;
+  return h;
+}
+function showTip(k, x, y) {
+  const h = tipHTML(k);
+  if (!h) return hideTip();
+  tipK = k; tipX = x; tipY = y;
+  put(tip, h);
+  tip.hidden = false;
+  const w = tip.offsetWidth, ht = tip.offsetHeight;
+  let L = x + 12, T = y + 14;
+  if (L + w > innerWidth - 8) L = Math.max(8, x - w - 12);
+  if (T + ht > innerHeight - 8) T = Math.max(8, y - ht - 12);
+  tip.style.transform = `translate(${Math.round(L)}px,${Math.round(T)}px)`;
+}
+function hideTip() { tipK = null; tipPin = false; tip.hidden = true; }
+const segOf = e => e.target instanceof Element ? e.target.closest('.kv [data-k]') : null;
+const below = el => { const r = el.getBoundingClientRect(); return [r.left + Math.min(r.width / 2, 40), r.bottom - 6]; };
+document.addEventListener('pointermove', e => {
+  if (e.pointerType === 'touch') return;
+  const el = segOf(e);
+  if (el) { tipPin = false; showTip(el.dataset.k, e.clientX, e.clientY); } else if (tipK && !tipPin) hideTip();
+}, {passive: true});
+document.addEventListener('click', e => { const el = segOf(e); if (el) { showTip(el.dataset.k, ...below(el)); tipPin = true; } else if (tipK) hideTip(); });
+document.addEventListener('focusin', e => { const el = segOf(e); if (el) showTip(el.dataset.k, ...below(el)); });
+document.addEventListener('focusout', e => { if (segOf(e)) hideTip(); });
+document.addEventListener('keydown', e => { if (e.key === 'Escape') hideTip(); });
+addEventListener('scroll', () => { if (tipK) hideTip(); }, {passive: true, capture: true});
+let rz = 0;
+addEventListener('resize', () => { clearTimeout(rz); rz = setTimeout(() => { if (S.st) renderBackends(); }, 120); });
+
+/* ---------- demo: a simulated gate, rendered by the same code ---------- */
+function Demo(seed, sink) {
+  let s = seed >>> 0 || 7, t = 11460000, tk = 2310, flips = 0;
+  const T0 = t, W = [], REC = [], C = {}, KB = 36500, PRI = {interactive: 3, standard: 2, batch: 1}; // ~36.5 KB of KV cache per token
+  const R = () => { let x = s = s + 0x6D2B79F5 | 0; x = Math.imul(x ^ x >>> 15, x | 1); x ^= x + Math.imul(x ^ x >>> 7, x | 61); return ((x ^ x >>> 14) >>> 0) / 4294967296; };
+  const ri = (a, b) => a + Math.floor(R() * (b - a + 1)), MA = 'qwen3.8-27b', MB = 'qwen3-coder-30b';
+  // client: class, model, seconds between requests, prompt range, generation limit, output range, chance it continues a conversation, API
+  const P = {openwebui: ['interactive', MA, 8, 2500, 36000, 8192, 160, 1300, .75, 'openai_chat'], 'desktop-app': ['standard', MA, 13, 1500, 22000, 8192, 120, 1000, .6, 'anthropic_messages'],
+    builder: ['standard', MB, 11, 6000, 24000, 6144, 250, 2000, .7, 'llama_infill'], 'batch-jobs': ['batch', MA, 30, 18000, 52000, 16384, 900, 3200, .1, 'openai_completions']};
+  for (const name in P) { // totals so far
+    const [, , every, lo, hi, , o1, o2, cont] = P[name], requests = Math.round(8000 / every), p = requests * (lo + hi) / 2, c = Math.round(p * cont * .9), g = requests * (o1 + o2) / 2;
+    C[name] = {name, requests, prompt_tokens: p, cached_tokens: c, generated_tokens: g, service: p - c + 2 * g};
+  }
+  const empty = () => ({st: 'empty', tok: 0, ctx: null, rq: null, until: 0});
+  const bk = (id, name, host, model, layout, capacity, swap, build, n, pp) => ({id, name, url: `http://${host}:8080`, model, layout, capacity, swap, partial_reuse: swap, incremental: true,
+    build, up: true, stray: 0, pp, slots: Array.from({length: n}, empty), sn: swap ? [{client: 'desktop-app', tok: 18240}, {client: 'openwebui', tok: 9050}] : []});
+  const BK = [bk(0, 'default', 'llama', MA, {kind: 'unified', capacity: 194560}, 194560, true, 'b6123-abc', 4, 1600), bk(1, 'gpu1', 'gpu1', MB, {kind: 'split', per_slot: 32768}, 98304, false, 'b6118-9f2', 3, 3200)];
+  const emit = (type, o) => sink({type, at_ms: t, ...o});
+  const used = b => b.slots.reduce((a, x) => a + x.tok, 0) + b.stray;
+  const cmp = (a, b) => PRI[b.class] - PRI[a.class] || C[a.client].service - C[b.client].service || a.q0 - b.q0;
+  const snap = (b, client, tok) => { b.sn.push({client, tok}); if (b.sn.length > 9) b.sn.shift(); };
+  const set = (b, i, o) => Object.assign(b.slots[i], o);
+  function record(r, b, slot, outcome, status, generated) {
+    const {ticket, client, model, dialect, prompt, measure_ms, preempted, bounced} = r, cached = r.cached || 0;
+    const rec = {ticket, at_ms: t, client, class: r.class, model, dialect, backend: b ? b.name : null, slot, outcome, status, prompt, cached, generated, measure_ms,
+      queue_ms: r.queue ?? t - r.q0, ttft_ms: r.first ? r.first - r.arrived : null, total_ms: t - r.arrived,
+      tokens_per_second: generated && r.genMs > 0 ? Math.round(generated * 1e4 / r.genMs) / 10 : null, preempted, bounced};
+    REC.unshift(rec);
+    REC.length = Math.min(REC.length, 50);
+    const c = C[client];
+    c.requests++;
+    if (!b) return;
+    c.prompt_tokens += prompt; c.cached_tokens += cached; c.generated_tokens += generated; c.service += prompt - cached + 2 * generated;
+    emit('finish', rec);
+  }
+  function refuse(r, reason) {
+    W.splice(W.indexOf(r), 1);
+    emit('reject', {ticket: r.ticket, client: r.client, class: r.class, reason, status: 429});
+    record(r, null, null, 'refused', 429, 0);
+  }
+  // Prefer the slot holding this conversation, then an empty one, then the least recently used idle one.
+  function pick(b, r) {
+    const sl = b.slots;
+    let i = r.cont ? sl.findIndex(x => x.st === 'idle' && x.ctx.client === r.client) : -1, reuse = 0;
+    if (i >= 0) reuse = Math.floor(Math.min(sl[i].ctx.tok, r.prompt) * (.9 + R() * .1));
+    else i = sl.findIndex(x => x.st === 'empty');
+    if (i < 0) sl.forEach((x, j) => { if (x.st === 'idle' && (i < 0 || x.used < sl[i].used)) i = j; });
+    return [i, reuse];
+  }
+  const fits = (b, i, r) => b.layout.kind === 'split' ? r.need <= b.layout.per_slot : used(b) - b.slots[i].tok + r.need <= b.capacity;
+  function dispatch(b, i, r, reuse) {
+    const x = b.slots[i], pend = [];
+    let prep = 0;
+    W.splice(W.indexOf(r), 1);
+    if (x.st === 'idle' && x.ctx.client !== r.client) { // replacing another conversation: save it (if swapping), then erase
+      const tokens = x.ctx.tok, ms = Math.round(tokens / (b.swap ? 55 : 900));
+      prep += ms;
+      pend.push(['evict', {outcome: b.swap ? 'saved' : 'erased', tokens, bytes: b.swap ? tokens * KB : null, ms}]);
+      if (b.swap) snap(b, x.ctx.client, tokens);
+    }
+    const k = !reuse && r.cont && b.swap ? b.sn.findIndex(y => y.client === r.client) : -1;
+    if (k >= 0) { // the conversation was saved earlier: restore it instead of recomputing
+      const tokens = b.sn.splice(k, 1)[0].tok, ms = Math.round(tokens / 27), ok = R() > .06;
+      prep += ms;
+      pend.push(['restore', {outcome: ok ? 'restored' : 'failed', tokens, ms}]);
+      if (ok) reuse = Math.min(tokens, r.prompt);
+    }
+    Object.assign(r, {cached: reuse, queue: t - r.q0, paused: false, started: false, first: 0, genMs: 0, run: t + prep,
+      pre: r.measure_ms + Math.round((r.prompt - reuse) / b.pp * 1e3) + ri(40, 160), tps: b.id ? 88 + R() * 40 : 54 + R() * 24});
+    set(b, i, {st: prep ? 'preparing' : 'running', tok: r.need, ctx: null, rq: r, until: prep && t + prep, pend});
+    emit('dispatch', {ticket: r.ticket, client: r.client, class: r.class, model: r.model, backend: b.name, slot: i, need: r.need, generation: r.gen, reuse, waited_ms: r.queue});
+  }
+  function finish(b, i, outcome, gen) {
+    const r = b.slots[i].rq, tok = r.prompt + gen;
+    record(r, b, i, outcome, {ok: 200, error: 500}[outcome] ?? null, gen);
+    set(b, i, {st: 'idle', rq: null, ctx: {client: r.client, tok}, tok, used: t});
+    if (b.swap && tok > 20000 && R() < .35) emit('save', {backend: b.name, slot: i, outcome: 'saved', tokens: tok, bytes: tok * KB, ms: Math.round(tok / 55)});
+  }
+  // The head does not fit: evict an idle context, or pause a batch request with no output yet.
+  function makeRoom(b, r) {
+    const sl = b.slots;
+    if (sl.some(x => x.st === 'evicting' || x.st === 'preempting')) return;
+    let v = -1;
+    if (b.layout.kind === 'unified') sl.forEach((x, j) => { if (x.st === 'idle' && !(r.cont && x.ctx.client === r.client) && (v < 0 || x.used < sl[v].used)) v = j; });
+    if (v >= 0) return set(b, v, {st: 'evicting', t0: t, until: t + Math.max(120, Math.round(sl[v].tok / 60))});
+    const j = r.class === 'interactive' && t - r.q0 > 2500 ? sl.findIndex(x => x.st === 'running' && x.rq.class === 'batch' && !x.rq.started) : -1, q = sl[j]?.rq;
+    if (!q) return;
+    set(b, j, {st: 'preempting', until: t + ri(500, 1100)});
+    Object.assign(q, {paused: true, cont: true, q0: t, bumped: q.bumped + 1, preempted: q.preempted + 1});
+    W.push(q);
+    emit('preempt', {ticket: q.ticket, client: q.client, backend: b.name, slot: j, outcome: 'paused'});
+  }
+  function stepSlots(b) {
+    b.slots.forEach((x, i) => {
+      const r = x.rq;
+      if (x.until && t >= x.until) {
+        x.until = 0;
+        if (x.st === 'preparing') { x.pend.forEach(([type, o]) => emit(type, {backend: b.name, slot: i, ...o})); x.st = 'running'; }
+        else if (x.st === 'preempting') { const tok = Math.max(512, Math.floor(r.done || 0)); set(b, i, {st: 'idle', rq: null, ctx: {client: r.client, tok}, tok, used: t}); r.paused = false; }
+        else if (x.st === 'faulted') set(b, i, empty()); // the erase is retried and succeeds
+        else if (x.st === 'evicting') {
+          const outcome = R() < .06 ? 'failed' : b.swap ? 'saved' : 'erased', saved = outcome === 'saved';
+          emit('evict', {backend: b.name, slot: i, outcome, tokens: x.tok, bytes: saved ? x.tok * KB : null, ms: t - x.t0});
+          if (saved) snap(b, x.ctx.client, x.tok);
+          set(b, i, outcome === 'failed' ? {st: 'faulted', until: t + ri(3000, 6000)} : empty());
+        }
+      }
+      if (x.st !== 'running') return;
+      const el = t - r.run;
+      r.done = Math.min(r.prompt, r.cached + el / 1e3 * b.pp);
+      if (!r.started && el >= r.pre) { r.started = true; r.first = t; }
+      if (!r.started) return;
+      const g = Math.floor((r.genMs = el - r.pre) / 1e3 * r.tps);
+      if (g >= r.out) finish(b, i, 'ok', r.out);
+      else if (r.client === 'openwebui' && R() < .0015) finish(b, i, 'cancelled', g);
+      else if (R() < .00025) finish(b, i, 'error', g);
+    });
+  }
+  function step(dt) {
+    t += dt;
+    const g = BK[1], up = (t - T0 + 95000) % 120000 < 85000, d0 = BK[0], q = (t - T0) % 90000; // gpu1 is down 35 s of every two minutes
+    if (g.up && !up) {
+      g.up = false;
+      emit('backend', {backend: g.name, state: 'down'});
+      g.slots.forEach((x, i) => {
+        const r = x.rq;
+        if (r && x.st === 'preempting') r.paused = false;
+        else if (r) { Object.assign(r, {bounced: r.bounced + 1, paused: false, cont: false, q0: t}); W.push(r); emit('bounce', {ticket: r.ticket, backend: g.name}); }
+        set(g, i, empty());
+      });
+    } else if (!g.up && up) { g.up = true; emit('backend', {backend: g.name, state: flips++ % 2 ? 'up' : 'restarted'}); }
+    d0.stray = q > 30000 && q < 52000 ? d0.stray || (d0.capacity - used(d0) > 6000 ? 2304 : 0) : 0;
+    for (const b of BK) if (b.up) stepSlots(b);
+    const mod = .55 + .9 * (.5 + .5 * Math.sin((t - T0) / 150000 * 2 * Math.PI)); // busy and quiet phases
+    for (const client in P) {
+      if (R() >= dt / 1e3 / P[client][2] * mod) continue;
+      const [cls, model, , lo, hi, gen, o1, o2, cont, dialect] = P[client], prompt = ri(lo, hi);
+      W.push({ticket: ++tk, client, class: cls, model, dialect, prompt, gen, need: prompt + gen, out: ri(o1, o2), arrived: t, q0: t, measure_ms: ri(3, 28),
+        bumped: 0, preempted: 0, bounced: 0, paused: false, cont: R() < cont});
+      if (W.length > 16) refuse(W[W.length - 1], 'queue_full');
+    }
+    for (const r of W.slice()) if (!r.paused && t - r.q0 > (r.class === 'batch' ? 50000 : 120000)) refuse(r, 'timeout');
+    const order = W.filter(r => !r.paused).sort(cmp);
+    for (const b of BK) {
+      let head = null;
+      for (const r of b.up ? order : []) {
+        if (r.model !== b.model) continue;
+        if (head && t - head.q0 > 8000) break; // small requests backfill only while the head is young
+        const [i, reuse] = pick(b, r);
+        if (i >= 0 && fits(b, i, r)) dispatch(b, i, r, reuse);
+        else if (!head) { head = r; makeRoom(b, r); }
+      }
+    }
+  }
+  function status() {
+    const wc = {}, rc = {};
+    W.forEach(r => { wc[r.client] = (wc[r.client] || 0) + 1; });
+    BK.forEach(b => b.slots.forEach(x => { if (x.rq && x.st !== 'preempting') rc[x.rq.client] = (rc[x.rq.client] || 0) + 1; }));
+    return {version: '0.2.0', ready: true, mode: 'enforce', uptime_ms: t,
+      models: [{id: 0, name: MA, aliases: ['/models/qwen3.8-27b.gguf'], backends: [0]}, {id: 1, name: MB, aliases: ['/models/qwen3-coder.gguf'], backends: [1]}],
+      backends: BK.map(({pp, sn, slots, ...b}) => ({...b, usage: used({slots, stray: b.stray}), snapshots: {count: sn.length, bytes: sn.reduce((a, y) => a + y.tok * KB, 0)},
+        slots: slots.map(({st, tok, rq: r}, index) => ({index, state: st, tokens: tok, ...r && {ticket: r.ticket, client: r.client, class: r.class, reuse: r.cached,
+          ...st !== 'preparing' && {running_ms: t - r.run, started: r.started, pausable: r.class === 'batch' && !r.started}}}))})),
+      waiting: [...W.filter(r => !r.paused).sort(cmp), ...W.filter(r => r.paused)].map(r => ({ticket: r.ticket, client: r.client, class: r.class, model: r.model, need: r.need, waited_ms: t - r.q0, bumped: r.bumped, paused: r.paused})),
+      clients: Object.values(C).map(c => ({...c, waiting: wc[c.name] || 0, running: rc[c.name] || 0})),
+      recent: REC.slice()};
+  }
+  return {step, status, notice: message => emit('notice', {message}), start: T0};
+}
+function startDemo() {
+  const sim = Demo(parseInt(Q.get('demo'), 10) || 7, onEvent), warm = 720, dt = 250;
+  S.anchor = Date.now() - (sim.start + warm * dt);
+  for (let i = 0; i < warm; i++) sim.step(dt); // three minutes of history before the first paint
+  sim.notice('Demo mode: all data on this page is simulated.');
+  applyStatus(sim.status());
+  setInterval(() => sim.step(dt), dt);
+  setInterval(() => applyStatus(sim.status()), 1000);
+}
+
+/* ---------- boot ---------- */
+$('key-btn').hidden = DEMO;
+setInterval(() => { renderUptime(); renderConn(); }, 1000);
+document.addEventListener('visibilitychange', () => { if (!document.hidden && !DEMO && !S.unauth) startPoll(); });
+renderConn(); renderNote(); renderEmpty(); renderFeedMeta();
+if (DEMO) startDemo(); else restart();
+})();
+</script>
+</body>
+</html>

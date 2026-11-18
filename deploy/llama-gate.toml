@@ -1,0 +1,26 @@
+# Configuration for deploy/docker-compose.yml. See examples/llama-gate.toml
+# for every option.
+
+[server]
+upstream = "http://llama:8081"
+
+[eviction]
+mode = "swap"
+directory = "/slots"
+
+# Chats go first; agents and batch work share what is left, and may be
+# paused for a chat while they have shown nothing yet.
+[classes.interactive]
+priority = 10
+
+[classes.standard]
+priority = 0
+preemptible = true
+
+[clients]
+default_class = "standard"
+
+# [[clients.rules]]
+# name = "chat-ui"
+# class = "interactive"
+# hosts = ["open-webui"]

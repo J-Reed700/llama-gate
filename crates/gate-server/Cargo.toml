@@ -1,0 +1,42 @@
+[package]
+name = "llama-gate"
+description = "A KV-aware admission and fair-scheduling gateway for llama.cpp servers"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+name = "gate_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "llama-gate"
+path = "src/main.rs"
+
+[dependencies]
+gate-core.workspace = true
+gate-llama.workspace = true
+axum.workspace = true
+bytes.workspace = true
+clap = { version = "4", features = ["derive", "env"] }
+futures-util.workspace = true
+ipnet.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+toml.workspace = true
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.29", default-features = false, features = ["signal"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

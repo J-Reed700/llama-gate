@@ -1,0 +1,22 @@
+[package]
+name = "gate-llama"
+description = "llama.cpp server adapter for llama-gate: control-plane client, request dialects, usage extraction"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+gate-core.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+axum.workspace = true
+
+[lints]
+workspace = true
