@@ -13,6 +13,45 @@ use std::future::Future;
 use std::net::IpAddr;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant};
+
+/// How long a host that stops resolving keeps its last addresses.
+const KEEP_UNRESOLVED: Duration = Duration::from_secs(120);
+
+/// Takes one lookup's result into what is known of `host`.
+fn remember(
+    known: &mut HashMap<String, Known>,
+    host: String,
+    found: Option<Vec<IpAddr>>,
+    now: Instant,
+) {
+    match found {
+        Some(addresses) => {
+            known.insert(
+                host,
+                Known {
+                    addresses,
+                    failing_since: None,
+                },
+            );
+        }
+        None => {
+            if let Some(entry) = known.get_mut(&host) {
+                let since = *entry.failing_since.get_or_insert(now);
+                if now.duration_since(since) > KEEP_UNRESOLVED {
+                    known.remove(&host);
+                }
+            }
+        }
+    }
+}
+
+/// A rule host's addresses, and since when it has failed to resolve.
+#[derive(Debug)]
+struct Known {
+    addresses: Vec<IpAddr>,
+    failing_since: Option<Instant>,
+}
 
 /// A request's identity for scheduling.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -137,6 +176,8 @@ pub struct Rules {
     names: Arc<Mutex<Names>>,
     /// Addresses of rule host names, refreshed by [`Rules::refresh`].
     resolved: RwLock<HashMap<IpAddr, usize>>,
+    /// Each host's last successful lookup, kept through brief failures.
+    known: Mutex<HashMap<String, Known>>,
     keys: Vec<Key>,
     required: bool,
     admin: Vec<Secret>,
@@ -201,6 +242,7 @@ impl Rules {
             use_openai_user: clients.use_openai_user,
             names,
             resolved: RwLock::new(HashMap::new()),
+            known: Mutex::new(HashMap::new()),
             keys,
             required: auth.required,
             admin: auth.admin_keys.clone(),
@@ -208,14 +250,34 @@ impl Rules {
     }
 
     /// Re-resolves rule host names, so a recreated container's new address
-    /// is recognized.
+    /// is recognized. A host whose lookup fails keeps its last addresses for
+    /// a while: a container restarting is briefly unresolvable, and its
+    /// clients should not change class meanwhile. Past that, the addresses
+    /// are dropped, so a recycled address does not keep a stranger's identity.
     pub async fn resolve(&self) {
+        let mut lookups = Vec::new();
+        for host in self.rules.iter().flat_map(|rule| &rule.hosts) {
+            let found = tokio::net::lookup_host((host.as_str(), 0))
+                .await
+                .ok()
+                .map(|addresses| addresses.map(|address| address.ip()).collect::<Vec<_>>())
+                .filter(|addresses| !addresses.is_empty());
+            lookups.push((host.clone(), found));
+        }
+        let now = Instant::now();
         let mut resolved = HashMap::new();
-        for (index, rule) in self.rules.iter().enumerate() {
-            for host in &rule.hosts {
-                if let Ok(addresses) = tokio::net::lookup_host((host.as_str(), 0)).await {
-                    for address in addresses {
-                        resolved.entry(address.ip()).or_insert(index);
+        {
+            let mut known = self
+                .known
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for (host, found) in lookups {
+                remember(&mut known, host, found, now);
+            }
+            for (index, rule) in self.rules.iter().enumerate() {
+                for host in &rule.hosts {
+                    for address in known.get(host).map_or(&[][..], |entry| &entry.addresses) {
+                        resolved.entry(*address).or_insert(index);
                     }
                 }
             }
@@ -291,8 +353,11 @@ impl Identify for Rules {
                 Some(flow) => format!("{}/{flow}", key.client),
                 None => key.client.clone(),
             };
-            let class = trusted_class
-                .or(key.class)
+            // A class given to a key is the key holder's, whatever header
+            // they send; the header only chooses for keys without one.
+            let class = key
+                .class
+                .or(trusted_class)
                 .or(rule.map(|rule| rule.class))
                 .unwrap_or(self.default_class);
             return Ok(self.intern(&name, class));
@@ -316,10 +381,15 @@ impl Identify for Rules {
         Ok(self.intern(&name, class))
     }
 
+    /// With admin keys, only they open the gate's own endpoints. Without
+    /// any, a gate that requires keys asks for one of its keys there too; an
+    /// open gate leaves them open.
     fn is_admin(&self, headers: &HeaderMap) -> bool {
-        self.admin.is_empty()
-            || presented_key(headers)
-                .is_some_and(|key| self.admin.iter().any(|secret| secret.matches(key)))
+        if !self.admin.is_empty() {
+            return presented_key(headers)
+                .is_some_and(|key| self.admin.iter().any(|secret| secret.matches(key)));
+        }
+        !self.required || self.key_for(headers).is_some()
     }
 
     fn owns_key(&self, headers: &HeaderMap) -> bool {
@@ -493,6 +563,93 @@ mod tests {
         assert!(
             rules.is_admin(&headers),
             "no admin keys: the gate's endpoints are open"
+        );
+    }
+
+    #[test]
+    fn a_host_that_stops_resolving_keeps_its_addresses_for_a_while() {
+        let mut known = HashMap::new();
+        let start = Instant::now();
+        let address: IpAddr = "172.18.0.5".parse().unwrap();
+        remember(&mut known, "openwebui".into(), Some(vec![address]), start);
+        remember(
+            &mut known,
+            "openwebui".into(),
+            None,
+            start + Duration::from_secs(5),
+        );
+        assert_eq!(
+            known["openwebui"].addresses,
+            vec![address],
+            "restarting, not gone"
+        );
+        remember(
+            &mut known,
+            "openwebui".into(),
+            None,
+            start + Duration::from_secs(200),
+        );
+        assert!(
+            !known.contains_key("openwebui"),
+            "gone long enough to be forgotten"
+        );
+        remember(
+            &mut known,
+            "openwebui".into(),
+            Some(vec![address]),
+            start + Duration::from_secs(201),
+        );
+        assert!(known["openwebui"].failing_since.is_none());
+    }
+
+    #[test]
+    fn a_keys_class_cannot_be_raised_by_a_header() {
+        let config = ClientsConfig {
+            trust_class_header: true,
+            ..ClientsConfig::default()
+        };
+        let auth = AuthConfig {
+            keys: vec![KeyConfig {
+                key: Secret::new("sk-batch"),
+                client: "nightly".into(),
+                class: Some("batch".into()),
+            }],
+            ..AuthConfig::default()
+        };
+        let rules = Rules::new(
+            &config,
+            &auth,
+            &["batch".into(), "interactive".into(), "standard".into()],
+            Arc::default(),
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer sk-batch".parse().unwrap());
+        headers.insert("x-gate-class", "interactive".parse().unwrap());
+        let identity = identify(&rules, "10.9.9.9", &headers, &json!({})).unwrap();
+        assert_eq!(identity.class, ClassId(0), "the key's class holds");
+    }
+
+    #[test]
+    fn a_gate_that_requires_keys_closes_its_own_endpoints_without_admin_keys() {
+        let auth = AuthConfig {
+            required: true,
+            keys: vec![KeyConfig {
+                key: Secret::new("sk-desk"),
+                client: "desktop-app".into(),
+                class: None,
+            }],
+            ..AuthConfig::default()
+        };
+        let rules = rules_with(auth);
+        assert!(
+            !rules.is_admin(&HeaderMap::new()),
+            "anonymous callers are kept out"
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer sk-desk".parse().unwrap());
+        assert!(
+            rules.is_admin(&headers),
+            "a holder of one of its keys may look"
         );
     }
 }

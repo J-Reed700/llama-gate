@@ -3,7 +3,6 @@
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Latency buckets in seconds, from interactive to batch scale.
 const BUCKETS: [f64; 16] = [
@@ -15,7 +14,22 @@ const CATALOG: &[(&str, &str, &str)] = &[
     (
         "llama_gate_requests_total",
         "counter",
-        "Scheduled requests by class and outcome.",
+        "Scheduled requests by class and outcome, counted once when they end.",
+    ),
+    (
+        "llama_gate_dispatches_total",
+        "counter",
+        "Times requests were sent to a server, by class (a paused or bounced request is sent again).",
+    ),
+    (
+        "llama_gate_rejections_total",
+        "counter",
+        "Requests refused, by class and reason.",
+    ),
+    (
+        "llama_gate_overruns_total",
+        "counter",
+        "Contexts that finished larger than their reservation, by backend.",
     ),
     (
         "llama_gate_prompt_tokens_total",
@@ -126,24 +140,41 @@ pub struct Metrics {
     histograms: [Histogram; HISTOGRAMS.len()],
 }
 
+/// One histogram, updated and read whole, so a scrape never sees a bucket
+/// above the total or a bucket above the next one.
 #[derive(Debug, Default)]
 struct Histogram {
-    counts: [AtomicU64; BUCKETS.len()],
-    total: AtomicU64,
+    data: Mutex<HistogramData>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct HistogramData {
+    counts: [u64; BUCKETS.len()],
+    total: u64,
     /// Sum in microseconds.
-    sum_micros: AtomicU64,
+    sum_micros: u64,
 }
 
 impl Histogram {
     fn observe(&self, seconds: f64) {
-        for (bucket, count) in BUCKETS.iter().zip(&self.counts) {
+        let mut data = self
+            .data
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for (bucket, count) in BUCKETS.iter().zip(&mut data.counts) {
             if seconds <= *bucket {
-                count.fetch_add(1, Ordering::Relaxed);
+                *count += 1;
             }
         }
-        self.total.fetch_add(1, Ordering::Relaxed);
-        self.sum_micros
-            .fetch_add((seconds.max(0.0) * 1e6) as u64, Ordering::Relaxed);
+        data.total += 1;
+        data.sum_micros += (seconds.max(0.0) * 1e6) as u64;
+    }
+
+    fn read(&self) -> HistogramData {
+        *self
+            .data
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
 
@@ -204,16 +235,13 @@ impl Metrics {
         }
         for ((name, help), histogram) in HISTOGRAMS.iter().zip(&self.histograms) {
             let _ = writeln!(out, "# HELP {name} {help}\n# TYPE {name} histogram");
-            for (bucket, count) in BUCKETS.iter().zip(&histogram.counts) {
-                let _ = writeln!(
-                    out,
-                    "{name}_bucket{{le=\"{bucket}\"}} {}",
-                    count.load(Ordering::Relaxed)
-                );
+            let data = histogram.read();
+            for (bucket, count) in BUCKETS.iter().zip(&data.counts) {
+                let _ = writeln!(out, "{name}_bucket{{le=\"{bucket}\"}} {count}");
             }
-            let total = histogram.total.load(Ordering::Relaxed);
+            let total = data.total;
             let _ = writeln!(out, "{name}_bucket{{le=\"+Inf\"}} {total}");
-            let sum = histogram.sum_micros.load(Ordering::Relaxed) as f64 / 1e6;
+            let sum = data.sum_micros as f64 / 1e6;
             let _ = writeln!(out, "{name}_sum {sum}\n{name}_count {total}");
         }
         out

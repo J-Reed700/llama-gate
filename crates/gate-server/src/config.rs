@@ -666,8 +666,11 @@ impl Config {
                     backend.name
                 ));
             }
+            // Compared as the filesystem resolves them: two spellings of one
+            // directory are one directory.
             if let Some(directory) = &backend.snapshots
-                && !directories.insert(directory.clone())
+                && !directories
+                    .insert(std::fs::canonicalize(directory).unwrap_or_else(|_| directory.clone()))
             {
                 problems.push(format!(
                     "snapshot directory {} is shared by two backends; each server needs its own",
@@ -690,8 +693,82 @@ impl Config {
         if self.admission.bytes_per_token.is_nan() || self.admission.bytes_per_token <= 0.0 {
             problems.push("admission.bytes_per_token must be positive".into());
         }
-        if !self.observe.path_prefix.starts_with('/') || self.observe.path_prefix.len() < 2 {
-            problems.push("observe.path_prefix must start with / and name a path".into());
+        let prefix = self.observe.path_prefix.trim_end_matches('/');
+        if !prefix.starts_with('/')
+            || prefix.contains("//")
+            || prefix
+                .chars()
+                .any(|c| c.is_whitespace() || matches!(c, '{' | '}' | '*' | '?'))
+        {
+            problems.push(format!(
+                "observe.path_prefix {:?} must be a path like /gate",
+                self.observe.path_prefix
+            ));
+        }
+        for (name, weight) in [
+            ("queue.input_weight", self.queue.input_weight),
+            ("queue.output_weight", self.queue.output_weight),
+        ] {
+            if !(weight.is_finite() && weight >= 0.0) {
+                problems.push(format!("{name} must be a number of at least 0"));
+            }
+        }
+        if !(self.queue.input_weight > 0.0 || self.queue.output_weight > 0.0) {
+            problems.push("queue.input_weight and queue.output_weight cannot both be 0".into());
+        }
+        // Zero would poll in a busy loop; anything this fast is a mistake.
+        for (name, every, floor) in [
+            ("server.health_interval", self.server.health_interval.0, 10),
+            (
+                "clients.resolve_interval",
+                self.clients.resolve_interval.0,
+                100,
+            ),
+            ("queue.tick", self.queue.tick.0, 10),
+        ] {
+            if every.as_millis() < floor {
+                problems.push(format!("{name} must be at least {floor} ms"));
+            }
+        }
+        let admission = &self.admission;
+        if admission.max_generation > 0 && admission.default_generation > admission.max_generation {
+            problems
+                .push("admission.default_generation cannot exceed admission.max_generation".into());
+        }
+        if admission.min_generation > admission.default_generation {
+            problems
+                .push("admission.min_generation cannot exceed admission.default_generation".into());
+        }
+        for (name, class) in &self.classes {
+            if let (Some(default), Some(max)) = (class.default_generation, class.max_generation)
+                && default > max
+            {
+                problems.push(format!(
+                    "class {name:?}: default_generation cannot exceed max_generation"
+                ));
+            }
+        }
+        if self.kv.capacity > 0 && self.kv.margin >= self.kv.capacity {
+            problems.push("kv.margin must be smaller than kv.capacity".into());
+        }
+        for backend in &backends {
+            if let (Some(capacity), margin) =
+                (backend.capacity, backend.margin.unwrap_or(self.kv.margin))
+                && capacity > 0
+                && margin >= capacity
+            {
+                problems.push(format!(
+                    "backend {:?}: margin must be smaller than capacity",
+                    backend.name
+                ));
+            }
+        }
+        // Classes and backends are numbered in 16 bits.
+        if self.classes.len() > usize::from(u16::MAX) {
+            problems.push("too many classes".into());
+        }
+        if backends.len() > usize::from(u16::MAX) {
+            problems.push("too many backends".into());
         }
         if problems.is_empty() {
             Ok(())
@@ -785,5 +862,30 @@ mod tests {
         let printed = toml::to_string(&config).unwrap();
         assert!(!printed.contains("sk-desktop"), "{printed}");
         Config::from_toml(&printed).unwrap();
+    }
+
+    #[test]
+    fn values_that_would_misbehave_at_runtime_are_refused() {
+        // Parsing validates; validating again must agree.
+        let refused = |toml: &str| {
+            Config::from_toml(toml)
+                .and_then(|config| config.validate())
+                .expect_err(toml)
+        };
+        assert!(refused("[observe]\npath_prefix = \"//\"").contains("path_prefix"));
+        assert!(refused("[server]\nhealth_interval = \"0s\"").contains("health_interval"));
+        assert!(refused("[clients]\nresolve_interval = \"0s\"").contains("resolve_interval"));
+        assert!(refused("[queue]\ninput_weight = -1.0").contains("input_weight"));
+        assert!(refused("[kv]\ncapacity = 1000\nmargin = 1000").contains("margin"));
+        assert!(
+            refused("[admission]\ndefault_generation = 100\nmax_generation = 50")
+                .contains("default_generation")
+        );
+        assert!(
+            Config::from_toml("[observe]\npath_prefix = \"/gate/\"")
+                .unwrap()
+                .validate()
+                .is_ok()
+        );
     }
 }

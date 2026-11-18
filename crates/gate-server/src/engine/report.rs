@@ -54,6 +54,9 @@ impl Engine {
             metrics.observe(Timing::TimeToFirstToken, ttft as f64 / 1000.0);
         }
         metrics.observe(Timing::Duration, report.total_ms as f64 / 1000.0);
+        // Once per request, all its waits together (a paused or bounced
+        // request waits more than once).
+        metrics.observe(Timing::QueueTime, report.queue_ms as f64 / 1000.0);
         metrics.observe(Timing::Measure, report.measure_ms as f64 / 1000.0);
         let stats = self.clients.entry(report.client.clone()).or_default();
         stats.requests += 1;
@@ -105,11 +108,11 @@ pub(super) fn rejection_status(rejection: &Rejection) -> u16 {
 
 pub(super) fn rejection_reason(rejection: &Rejection) -> &'static str {
     match rejection {
-        Rejection::TooLarge { .. } => "rejected_too_large",
-        Rejection::Timeout { .. } => "rejected_timeout",
-        Rejection::QueueFull { .. } => "rejected_queue_full",
-        Rejection::UnknownClass => "rejected_unknown_class",
-        Rejection::Unavailable { .. } => "rejected_unavailable",
-        Rejection::ShuttingDown => "rejected_shutting_down",
+        Rejection::TooLarge { .. } => "too_large",
+        Rejection::Timeout { .. } => "timeout",
+        Rejection::QueueFull { .. } => "queue_full",
+        Rejection::UnknownClass => "unknown_class",
+        Rejection::Unavailable { .. } => "unavailable",
+        Rejection::ShuttingDown => "shutting_down",
     }
 }

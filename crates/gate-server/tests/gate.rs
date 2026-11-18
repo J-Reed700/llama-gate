@@ -333,7 +333,7 @@ async fn metrics_status_and_the_dashboard_describe_the_gate() {
     assert_eq!(post(&gate.url, chat_body("m-", 20, 2, false)).await.0, 200);
     let metrics = metrics_of(&gate).await;
     assert!(
-        metrics.contains("llama_gate_requests_total{class=\"standard\",outcome=\"dispatched\"} 1"),
+        metrics.contains("llama_gate_dispatches_total{class=\"standard\"} 1"),
         "{metrics}"
     );
     assert!(

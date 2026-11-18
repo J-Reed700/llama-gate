@@ -24,11 +24,9 @@ impl Engine {
                     });
                 };
                 let waited = waiter.since.elapsed();
-                self.metrics
-                    .observe(Timing::QueueTime, waited.as_secs_f64());
                 self.metrics.count(
-                    "llama_gate_requests_total",
-                    labels(&[("class", &waiter.class), ("outcome", "dispatched")]),
+                    "llama_gate_dispatches_total",
+                    labels(&[("class", &waiter.class)]),
                     1,
                 );
                 let backend = self.name(slot.backend);
@@ -83,8 +81,8 @@ impl Engine {
                 if let Some(waiter) = self.waiting.remove(&ticket) {
                     let reason = rejection_reason(&rejection);
                     self.metrics.count(
-                        "llama_gate_requests_total",
-                        labels(&[("class", &waiter.class), ("outcome", reason)]),
+                        "llama_gate_rejections_total",
+                        labels(&[("class", &waiter.class), ("reason", reason)]),
                         1,
                     );
                     warn!(%ticket, client = %waiter.client, class = %waiter.class, reason, "request refused");

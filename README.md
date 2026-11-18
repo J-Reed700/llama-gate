@@ -737,14 +737,17 @@ Named after vLLM and llm-d conventions, so existing dashboards translate.
 
 | Metric | Type | Meaning |
 | --- | --- | --- |
-| `llama_gate_requests_total` | counter | Scheduled requests, by class and outcome |
+| `llama_gate_requests_total` | counter | Scheduled requests, by class and outcome, counted once when they end |
+| `llama_gate_dispatches_total` | counter | Times requests were sent to a server, by class (a paused or bounced request is sent again) |
+| `llama_gate_rejections_total` | counter | Requests refused, by class and reason (`too_large`, `timeout`, `queue_full`, `unavailable`, `shutting_down`) |
+| `llama_gate_overruns_total` | counter | Contexts that finished larger than their reservation, by server |
 | `llama_gate_prompt_tokens_total` | counter | Prompt tokens admitted, by how they were measured (exact, incremental, estimated) |
 | `llama_gate_cached_prompt_tokens_total` | counter | Prompt tokens servers reused from their cache |
 | `llama_gate_generated_tokens_total` | counter | Tokens generated, by class |
 | `llama_gate_evictions_total` | counter | Idle contexts cleared to make room, by outcome |
 | `llama_gate_restores_total` | counter | Saved contexts restored, by outcome |
 | `llama_gate_preemptions_total` | counter | Requests paused for more urgent work (paused, declined) |
-| `llama_gate_bounces_total` | counter | Requests placed again because their server refused the connection |
+| `llama_gate_bounces_total` | counter | Requests placed again because their server refused the connection or was still loading |
 | `llama_gate_upstream_resets_total` | counter | Times a server restarted or changed shape |
 | `llama_gate_requests_waiting` | gauge | Requests waiting for room |
 | `llama_gate_requests_running` | gauge | Requests running |
@@ -754,8 +757,8 @@ Named after vLLM and llm-d conventions, so existing dashboards translate.
 | `llama_gate_snapshots` | gauge | Saved contexts per server |
 | `llama_gate_snapshot_bytes` | gauge | Disk used by saved contexts per server |
 | `llama_gate_upstream_up` | gauge | 1 while a server is ready |
-| `llama_gate_request_queue_time_seconds` | histogram | Time requests waited |
-| `llama_gate_time_to_first_token_seconds` | histogram | Arrival to the first output reaching the client |
+| `llama_gate_request_queue_time_seconds` | histogram | Time requests waited, all their waits together |
+| `llama_gate_time_to_first_token_seconds` | histogram | Arrival to the first generated output reaching the client (progress events don't count) |
 | `llama_gate_request_duration_seconds` | histogram | Arrival to the end of the response |
 | `llama_gate_measure_seconds` | histogram | Time spent measuring prompts |
 
