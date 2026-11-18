@@ -30,12 +30,17 @@ pub async fn watch_upstream(
             match server.info().await {
                 Ok(info) => {
                     let slots = server.slots().await.unwrap_or_default();
-                    let task = slots.iter().filter_map(|view| view.task).max();
-                    // Task ids only grow during a server's life; after a
-                    // restart every slot starts over.
+                    let task = slots
+                        .iter()
+                        .filter_map(|view| view.task.filter(|task| *task >= 0))
+                        .max();
+                    // Task ids only grow during a server's life, and a slot
+                    // keeps its last one; after a restart every slot starts
+                    // over with none, even with the same flags and model.
                     let went_backwards =
                         matches!((last_task, task), (Some(before), Some(now)) if now < before);
-                    let blind_restart = slots.is_empty() && down_polls >= 2;
+                    let forgot = last_task.is_some() && task.is_none() && !slots.is_empty();
+                    let blind_restart = (slots.is_empty() && down_polls >= 2) || forgot;
                     let changed = last_info.as_ref() != Some(&info);
                     if !ready_before || changed || went_backwards || blind_restart || down_polls > 0
                     {
@@ -88,7 +93,8 @@ pub async fn watch_upstream(
                     }
                     ready_before = true;
                     last_info = Some(info);
-                    if task.is_some() {
+                    // A restart seen once is not seen again on the next poll.
+                    if task.is_some() || forgot {
                         last_task = task;
                     }
                     down_polls = 0;

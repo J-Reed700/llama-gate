@@ -51,6 +51,9 @@ pub struct FakeState {
     pub cancelled: AtomicU64,
     pub peak: AtomicU64,
     pub model: String,
+    /// Answers this many more generation requests with 503 "Loading model",
+    /// as llama.cpp does while it loads.
+    pub loading: AtomicU64,
     next_task: AtomicI64,
     freed: Notify,
 }
@@ -102,6 +105,7 @@ impl Fake {
             cancelled: AtomicU64::new(0),
             peak: AtomicU64::new(0),
             model: model.into(),
+            loading: AtomicU64::new(0),
             next_task: AtomicI64::new(0),
             freed: Notify::new(),
         });
@@ -130,6 +134,17 @@ impl Fake {
 
     pub fn set_prefill(&self, delay: Duration) {
         *self.state.prefill.lock().unwrap() = delay;
+    }
+
+    /// Restarts the server in place: same model, same flags, empty slots
+    /// that have run no task yet.
+    pub fn restart(&self) {
+        for slot in self.state.slots.lock().unwrap().iter_mut() {
+            *slot = FakeSlot {
+                task: -1,
+                ..FakeSlot::default()
+            };
+        }
     }
 }
 
@@ -363,6 +378,19 @@ async fn embeddings(State(state): State<Arc<FakeState>>, Json(body): Json<Value>
 }
 
 async fn chat(State(state): State<Arc<FakeState>>, Json(body): Json<Value>) -> Response {
+    if state
+        .loading
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+            left.checked_sub(1)
+        })
+        .is_ok()
+    {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": {"code": 503, "message": "Loading model", "type": "unavailable_error"}})),
+        )
+            .into_response();
+    }
     let prompt = words(&render(&body));
     let hint = body["messages"]
         .as_array()

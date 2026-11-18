@@ -745,10 +745,12 @@ impl Scheduler {
             }
         };
         // Nothing reached the server, so the slot holds what it held before,
-        // which the reservation covers; what exactly is no longer known.
+        // which the reservation covers; what exactly is no longer known. It
+        // is erased as soon as its server is back: no failed erase to wait
+        // out, unlike an ordinary fault.
         *state = SlotState::Faulted {
             holding: running.reserved,
-            since: now,
+            retry_at: now,
         };
         backend.online = false;
         self.enqueue(running.waiting);
@@ -762,6 +764,7 @@ impl Scheduler {
         now: Millis,
         out: &mut Vec<Command>,
     ) {
+        let retry_at = now.saturating_add(self.config.eviction.retry_after);
         let Some(state) = self.slot_mut(slot) else {
             return;
         };
@@ -786,7 +789,7 @@ impl Scheduler {
                 EvictOutcome::Failed => {
                     *state = SlotState::Faulted {
                         holding: resident.tokens,
-                        since: now,
+                        retry_at,
                     };
                 }
                 EvictOutcome::Saved { bytes, tokens } => {
@@ -811,7 +814,7 @@ impl Scheduler {
                     EvictOutcome::Failed => {
                         *state = SlotState::Faulted {
                             holding: claim.holding,
-                            since: now,
+                            retry_at,
                         };
                         if !claim.abandoned {
                             self.enqueue(claim.waiting);
@@ -1013,6 +1016,7 @@ impl Scheduler {
         now: Millis,
         out: &mut Vec<Command>,
     ) {
+        let retry_at = now.saturating_add(self.config.eviction.retry_after);
         let Some(state) = self.slot_mut(slot) else {
             return;
         };
@@ -1058,7 +1062,7 @@ impl Scheduler {
                         slot,
                         SlotState::Faulted {
                             holding: running.reserved,
-                            since: now,
+                            retry_at,
                         },
                     ),
                     EvictOutcome::Saved { bytes, tokens } => {
@@ -1079,6 +1083,7 @@ impl Scheduler {
     /// Reconciles the server's view of its slots with the ledger. A report
     /// never lowers what the ledger holds: it leaves out answers.
     fn observe(&mut self, observations: &[Observation], now: Millis, out: &mut Vec<Command>) {
+        let retry_at = now.saturating_add(self.config.eviction.retry_after);
         let mut foreign: BTreeMap<BackendId, Vec<usize>> = BTreeMap::new();
         for observation in observations {
             let Some(backend) = self.backend_mut(observation.slot.backend) else {
@@ -1094,7 +1099,7 @@ impl Scheduler {
                     // the slot can be erased.
                     *state = SlotState::Faulted {
                         holding: limit,
-                        since: now,
+                        retry_at,
                     };
                 }
                 // Content the gate did not place, of a size the report
@@ -1229,21 +1234,20 @@ impl Scheduler {
                 None => index += 1,
             }
         }
-        let retry_after = self.config.eviction.retry_after;
         let mut retries = Vec::new();
         for (backend_index, backend) in self.backends.iter().enumerate() {
             if !backend.online {
                 continue;
             }
             for (slot, state) in backend.pool.slots.iter().enumerate() {
-                if let SlotState::Faulted { holding, since } = *state
-                    && now.saturating_sub(since) >= retry_after
+                if let SlotState::Faulted { holding, retry_at } = *state
+                    && now >= retry_at
                 {
-                    retries.push((SlotId::new(backend_index as u16, slot), holding, since));
+                    retries.push((SlotId::new(backend_index as u16, slot), holding));
                 }
             }
         }
-        for (slot, holding, since) in retries {
+        for (slot, holding) in retries {
             let op = self.next_op();
             self.set(
                 slot,
@@ -1251,7 +1255,7 @@ impl Scheduler {
                     resident: Resident {
                         tokens: holding,
                         prefix: Prefix::opaque(holding),
-                        last_used: since,
+                        last_used: now,
                     },
                     save: None,
                     op,

@@ -133,10 +133,11 @@ pub(crate) enum SlotState {
         save: Option<SnapshotId>,
         op: OpId,
     },
-    /// An operation failed and the content is unknown. Retried by erasing.
+    /// An operation failed and the content is unknown. Erased (again) from
+    /// `retry_at` on, while its server is online.
     Faulted {
         holding: Tokens,
-        since: Millis,
+        retry_at: Millis,
     },
 }
 

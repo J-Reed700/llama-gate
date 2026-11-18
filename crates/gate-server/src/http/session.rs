@@ -161,6 +161,9 @@ pub(super) async fn generate(
     session.run(grant).await
 }
 
+/// Times a request may be placed again because its server was not ready.
+const MAX_BOUNCES: u32 = 8;
+
 /// One attempt at running the request on a granted slot.
 pub(super) enum Attempt {
     Response(reqwest::Response),
@@ -322,8 +325,18 @@ impl Session {
                 Some(next) => Attempt::Paused(next),
                 None => Attempt::Failed("paused without a way to resume".into()),
             },
+            // A server still loading its model (or waking from sleep)
+            // answers 503 before doing anything: like a refused connection,
+            // the request is placed again rather than failed. Bounded, so a
+            // server that only ever answers 503 still gets its answer through.
+            Some(Ok(response))
+                if response.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE
+                    && self.report.bounced < MAX_BOUNCES =>
+            {
+                Attempt::Bounced(self.state.handle.bounce(self.ticket))
+            }
             Some(Ok(response)) => Attempt::Response(response),
-            Some(Err(error)) if error.is_connect() => {
+            Some(Err(error)) if error.is_connect() && self.report.bounced < MAX_BOUNCES => {
                 Attempt::Bounced(self.state.handle.bounce(self.ticket))
             }
             Some(Err(error)) => Attempt::Failed(format!("upstream request failed: {error}")),

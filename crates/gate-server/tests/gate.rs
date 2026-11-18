@@ -748,3 +748,49 @@ async fn an_error_reported_mid_stream_is_recorded_as_a_failure() {
         status["recent"][0]
     );
 }
+
+/// A server still loading its model answers 503 before doing anything: the
+/// request is placed again, not failed.
+#[tokio::test]
+async fn a_server_still_loading_its_model_is_waited_for() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("llama_gate=debug,gate_server=debug")
+        .with_test_writer()
+        .try_init();
+    let fake = Fake::start(2_000, 2, None, Duration::from_millis(1)).await;
+    let gate = gate(&fake, |_| {}).await;
+    fake.state.loading.store(2, Ordering::SeqCst);
+    let (status, body) = post(&gate.url, chat_body("loading-", 100, 4, false)).await;
+    assert_eq!(status, 200, "{body}");
+    let status = status_of(&gate).await;
+    assert!(
+        status["recent"][0]["bounced"].as_u64().unwrap() >= 1,
+        "{}",
+        status["recent"][0]
+    );
+}
+
+/// A server restarted with the same model and flags looks the same from
+/// outside, except that its slots have forgotten their tasks: the gate's
+/// picture of those slots starts over.
+#[tokio::test]
+async fn a_plain_restart_is_noticed() {
+    let fake = Fake::start(2_000, 2, None, Duration::from_millis(1)).await;
+    let gate = gate(&fake, |_| {}).await;
+    let (status, _) = post(&gate.url, chat_body("before-", 100, 4, false)).await;
+    assert_eq!(status, 200);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    fake.restart();
+    let mut noticed = false;
+    for _ in 0..40 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if metrics_of(&gate)
+            .await
+            .contains("llama_gate_upstream_resets_total")
+        {
+            noticed = true;
+            break;
+        }
+    }
+    assert!(noticed, "{}", metrics_of(&gate).await);
+}
