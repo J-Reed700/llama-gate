@@ -179,11 +179,7 @@ mod tests {
                     if let Some(token) = right.get_mut(differ) {
                         *token += 1;
                     }
-                    let common = left
-                        .iter()
-                        .zip(&right)
-                        .take_while(|(a, b)| a == b)
-                        .count();
+                    let common = left.iter().zip(&right).take_while(|(a, b)| a == b).count();
                     let (lp, rp) = (
                         Prefix::from_tokens(left, block),
                         Prefix::from_tokens(&right, block),

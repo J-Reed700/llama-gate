@@ -7,7 +7,7 @@
 //! work before its output begins (it waits, then resumes where it stopped).
 //! The client sees one response throughout, and however the session ends it
 //! is reported to the engine exactly once. Everything else passes through.
-use crate::clients::{Identify, Identity, Names, IdentifyResult};
+use crate::clients::{Identify, IdentifyResult, Identity, Names};
 use crate::config::{Config, Mode};
 use crate::control::Control;
 use crate::engine::{Arrival, BackendLink, Grant, Handle, Report};
@@ -168,7 +168,9 @@ async fn proxy(
         IdentifyResult::Identified(identity) => (identity, Bytes::new(), Value::Null),
         IdentifyResult::NeedsBody(state) => {
             let bytes =
-                match tokio::time::timeout(config.server.body_timeout.0, to_bytes(body, max_body)).await {
+                match tokio::time::timeout(config.server.body_timeout.0, to_bytes(body, max_body))
+                    .await
+                {
                     Ok(Ok(bytes)) => bytes,
                     Ok(Err(_)) => {
                         return Err(error(
@@ -190,11 +192,16 @@ async fn proxy(
             } else {
                 Value::Null
             };
-            let identity = live.identify.identify_body(state, &body).map_err(|denied| error(
-                StatusCode::UNAUTHORIZED,
-                "authentication_error",
-                denied.message().into(),
-            ))?;
+            let identity = live
+                .identify
+                .identify_body(state, &body)
+                .map_err(|denied| {
+                    error(
+                        StatusCode::UNAUTHORIZED,
+                        "authentication_error",
+                        denied.message().into(),
+                    )
+                })?;
             (identity, bytes, body)
         }
     };
@@ -224,7 +231,11 @@ async fn proxy(
     let (Some(dialect), true) = (dialect, body.is_object()) else {
         // Not scheduled: pass through to a server of the requested model.
         let Some(link) = state.backend_for(model) else {
-            return Err(error(StatusCode::BAD_GATEWAY, "server_error", "no backend".into()));
+            return Err(error(
+                StatusCode::BAD_GATEWAY,
+                "server_error",
+                "no backend".into(),
+            ));
         };
         return Ok(relay(
             &state,

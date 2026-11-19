@@ -13,7 +13,7 @@
 use gate_core::{Candidate, ClassId, ClientId, EvictionOrder, QueueOrder, Resident, SlotId};
 use gate_llama::{Dialect, Dialects, Prompt};
 use gate_server::Gate;
-use gate_server::clients::{Denied, Identify, Identity, IdentifyResult, IntermediateState};
+use gate_server::clients::{Denied, Identify, IdentifyResult, Identity, IntermediateState};
 use gate_server::config::Config;
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -50,7 +50,11 @@ impl EvictionOrder for KeepLongContexts {
 struct ByTenant;
 
 impl Identify for ByTenant {
-    fn identify_headers(&self, headers: &axum::http::HeaderMap, _peer: std::net::IpAddr) -> Result<IdentifyResult, Denied> {
+    fn identify_headers(
+        &self,
+        headers: &axum::http::HeaderMap,
+        _peer: std::net::IpAddr,
+    ) -> Result<IdentifyResult, Denied> {
         let tenant = headers
             .get("x-tenant")
             .and_then(|value| value.to_str().ok())
