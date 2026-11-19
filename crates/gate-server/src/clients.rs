@@ -86,13 +86,25 @@ impl Denied {
     }
 }
 
+pub enum IdentifyResult {
+    Identified(Identity),
+    NeedsBody(IntermediateState),
+}
+
+pub struct IntermediateState {
+    pub peer: IpAddr,
+    pub rule_index: Option<usize>,
+    pub flow: Option<String>,
+    pub trusted_class: Option<ClassId>,
+}
+
 /// Decides who a request is from, and whether it may be served.
 pub trait Identify: Send + Sync + std::fmt::Debug {
-    fn identify(&self, caller: &Caller<'_>) -> Result<Identity, Denied>;
+    fn identify_headers(&self, headers: &HeaderMap, peer: IpAddr) -> Result<IdentifyResult, Denied>;
 
-    /// Refuses a request from its headers alone, before its body is read
-    /// (a missing or unknown required key). [`Identify::identify`] still
-    /// decides once the body is in.
+    fn identify_body(&self, state: IntermediateState, body: &Value) -> Result<Identity, Denied>;
+
+    /// Refuses a request from its headers alone, before its body is read.
     fn precheck(&self, _headers: &HeaderMap) -> Result<(), Denied> {
         Ok(())
     }
@@ -311,12 +323,11 @@ impl Rules {
             *current = resolved;
         }
     }
-
     pub fn has_hosts(&self) -> bool {
         self.rules.iter().any(|rule| !rule.hosts.is_empty())
     }
 
-    fn rule_for(&self, peer: IpAddr, headers: &HeaderMap) -> Option<&CompiledRule> {
+    fn rule_for(&self, peer: IpAddr, headers: &HeaderMap) -> Option<(usize, &CompiledRule)> {
         let peer = canonical(peer);
         let resolved = self.resolved.read().ok();
         self.rules.iter().enumerate().find_map(|(index, rule)| {
@@ -331,7 +342,7 @@ impl Rules {
                 .as_ref()
                 .and_then(|resolved| resolved.get(&peer))
                 .is_some_and(|matched| *matched == index);
-            (by_header || by_network || by_host).then_some(rule)
+            (by_header || by_network || by_host).then_some((index, rule))
         })
     }
 
@@ -370,8 +381,7 @@ impl Identify for Rules {
         Ok(())
     }
 
-    fn identify(&self, caller: &Caller<'_>) -> Result<Identity, Denied> {
-        let headers = caller.headers;
+    fn identify_headers(&self, headers: &HeaderMap, peer: IpAddr) -> Result<IdentifyResult, Denied> {
         let key = self.key_for(headers);
         if self.required && key.is_none() {
             return Err(match presented_key(headers) {
@@ -379,40 +389,74 @@ impl Identify for Rules {
                 None => Denied::MissingKey,
             });
         }
-        let rule = self.rule_for(caller.peer, headers);
-        let flow = Self::header(headers, self.identity_header.as_ref());
+        let rule = self.rule_for(peer, headers);
+        let flow = Self::header(headers, self.identity_header.as_ref()).map(String::from);
         let trusted_class = Self::header(headers, self.class_header.as_ref())
             .and_then(|name| self.classes.get(name).copied());
+        
         if let Some(key) = key {
-            let name = match flow {
+            let name = match &flow {
                 Some(flow) => format!("{}/{flow}", key.client),
                 None => key.client.clone(),
             };
-            // A class given to a key is the key holder's, whatever header
-            // they send; the header only chooses for keys without one.
             let class = key
                 .class
                 .or(trusted_class)
-                .or(rule.map(|rule| rule.class))
+                .or(rule.map(|(_, rule)| rule.class))
                 .unwrap_or(self.default_class);
-            return Ok(self.intern(&name, class));
+            return Ok(IdentifyResult::Identified(self.intern(&name, class)));
         }
-        let user = self
-            .use_openai_user
-            .then(|| caller.body.get("user").and_then(Value::as_str))
-            .flatten()
+        
+        if let Some((rule_index, rule)) = rule {
+             if !self.use_openai_user {
+                 let name = match &flow {
+                     Some(flow) => format!("{}/{flow}", rule.name),
+                     None => rule.name.clone(),
+                 };
+                 let class = trusted_class
+                     .or(Some(rule.class))
+                     .unwrap_or(self.default_class);
+                 return Ok(IdentifyResult::Identified(self.intern(&name, class)));
+             }
+             return Ok(IdentifyResult::NeedsBody(IntermediateState {
+                 peer,
+                 rule_index: Some(rule_index),
+                 flow,
+                 trusted_class,
+             }));
+        }
+        
+        if self.use_openai_user {
+            return Ok(IdentifyResult::NeedsBody(IntermediateState {
+                peer,
+                rule_index: None,
+                flow,
+                trusted_class,
+            }));
+        }
+        
+        let name = flow.unwrap_or_else(|| canonical(peer).to_string());
+        Ok(IdentifyResult::Identified(self.intern(&name, self.default_class)))
+    }
+
+    fn identify_body(&self, state: IntermediateState, body: &Value) -> Result<Identity, Denied> {
+        let rule = state.rule_index.map(|index| &self.rules[index]);
+        let user = body.get("user").and_then(Value::as_str)
             .map(str::trim)
             .filter(|user| !user.is_empty() && user.len() <= 128);
-        let name = match (rule, flow, user) {
+            
+        let name = match (rule, state.flow, user) {
             (Some(rule), Some(flow), _) => format!("{}/{flow}", rule.name),
             (Some(rule), None, _) => rule.name.clone(),
-            (None, Some(flow), _) => flow.to_owned(),
+            (None, Some(flow), _) => flow,
             (None, None, Some(user)) => format!("user:{user}"),
-            (None, None, None) => canonical(caller.peer).to_string(),
+            (None, None, None) => canonical(state.peer).to_string(),
         };
-        let class = trusted_class
+        
+        let class = state.trusted_class
             .or(rule.map(|rule| rule.class))
             .unwrap_or(self.default_class);
+            
         Ok(self.intern(&name, class))
     }
 
@@ -493,11 +537,10 @@ mod tests {
         headers: &HeaderMap,
         body: &Value,
     ) -> Result<Identity, Denied> {
-        rules.identify(&Caller {
-            peer: peer.parse().unwrap(),
-            headers,
-            body,
-        })
+        match rules.identify_headers(headers, peer.parse().unwrap())? {
+            IdentifyResult::Identified(id) => Ok(id),
+            IdentifyResult::NeedsBody(state) => rules.identify_body(state, body),
+        }
     }
 
     #[test]

@@ -2,6 +2,7 @@
 //! events, reload, and the model list.
 
 use super::*;
+use crate::clients::{Caller, IdentifyResult};
 
 /// The dashboard page, compiled into the binary.
 pub(super) const DASHBOARD: &str = include_str!("../../assets/dashboard.html");
@@ -184,17 +185,21 @@ pub(super) async fn models(
     request: Request,
 ) -> Response {
     let (parts, _) = request.into_parts();
-    let caller = Caller {
+    let _ = Caller {
         peer: peer.ip(),
         headers: &parts.headers,
         body: &Value::Null,
     };
-    if let Err(denied) = state.identify().identify(&caller) {
-        return error(
-            StatusCode::UNAUTHORIZED,
-            "authentication_error",
-            denied.message().into(),
-        );
+    match state.identify().identify_headers(&parts.headers, peer.ip()) {
+        Ok(IdentifyResult::Identified(_)) => (),
+        Ok(IdentifyResult::NeedsBody(_)) => (), // Should not happen
+        Err(denied) => {
+            return error(
+                StatusCode::UNAUTHORIZED,
+                "authentication_error",
+                denied.message().into(),
+            );
+        }
     }
     if state.backends.len() == 1
         && let Some(link) = state.backend_for(None)

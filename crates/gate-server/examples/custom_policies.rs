@@ -13,7 +13,7 @@
 use gate_core::{Candidate, ClassId, ClientId, EvictionOrder, QueueOrder, Resident, SlotId};
 use gate_llama::{Dialect, Dialects, Prompt};
 use gate_server::Gate;
-use gate_server::clients::{Caller, Denied, Identify, Identity};
+use gate_server::clients::{Denied, Identify, Identity, IdentifyResult, IntermediateState};
 use gate_server::config::Config;
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -50,14 +50,11 @@ impl EvictionOrder for KeepLongContexts {
 struct ByTenant;
 
 impl Identify for ByTenant {
-    fn identify(&self, caller: &Caller<'_>) -> Result<Identity, Denied> {
-        let tenant = caller
-            .headers
+    fn identify_headers(&self, headers: &axum::http::HeaderMap, _peer: std::net::IpAddr) -> Result<IdentifyResult, Denied> {
+        let tenant = headers
             .get("x-tenant")
             .and_then(|value| value.to_str().ok())
             .ok_or(Denied::MissingKey)?;
-        // A real implementation would intern names; a stable hash is enough
-        // to show the shape.
         let client = ClientId(tenant.bytes().fold(0u32, |hash, byte| {
             hash.wrapping_mul(31).wrapping_add(u32::from(byte))
         }));
@@ -66,11 +63,15 @@ impl Identify for ByTenant {
         } else {
             ClassId(0)
         };
-        Ok(Identity {
+        Ok(IdentifyResult::Identified(Identity {
             client,
             name: Arc::from(tenant),
             class,
-        })
+        }))
+    }
+
+    fn identify_body(&self, _state: IntermediateState, _body: &Value) -> Result<Identity, Denied> {
+        Err(Denied::MissingKey)
     }
 }
 

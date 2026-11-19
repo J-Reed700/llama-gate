@@ -7,7 +7,7 @@
 //! work before its output begins (it waits, then resumes where it stopped).
 //! The client sees one response throughout, and however the session ends it
 //! is reported to the engine exactly once. Everything else passes through.
-use crate::clients::{Caller, Identify, Identity, Names};
+use crate::clients::{Identify, Identity, Names, IdentifyResult};
 use crate::config::{Config, Mode};
 use crate::control::Control;
 use crate::engine::{Arrival, BackendLink, Grant, Handle, Report};
@@ -144,75 +144,77 @@ async fn proxy(
     State(state): State<Arc<AppState>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     request: Request,
-) -> Response {
+) -> Result<Response, Response> {
     // One snapshot for the whole request: a reload meanwhile cannot pair
     // this configuration with other rules.
     let live = state.live();
     let config = live.config.clone();
     let (parts, body) = request.into_parts();
-    // A caller the gate will refuse anyway does not get to send a body.
-    if let Err(denied) = live.identify.precheck(&parts.headers) {
-        return error(
-            StatusCode::UNAUTHORIZED,
-            "authentication_error",
-            denied.message().into(),
-        );
-    }
+    let peer_ip = peer.ip();
+
+    let identity_result = match live.identify.identify_headers(&parts.headers, peer_ip) {
+        Ok(res) => res,
+        Err(denied) => {
+            return Err(error(
+                StatusCode::UNAUTHORIZED,
+                "authentication_error",
+                denied.message().into(),
+            ));
+        }
+    };
+
     let max_body = config.server.max_body.0 as usize;
-    let bytes =
-        match tokio::time::timeout(config.server.body_timeout.0, to_bytes(body, max_body)).await {
-            Ok(Ok(bytes)) => bytes,
-            Ok(Err(_)) => {
-                return error(
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    "invalid_request_error",
-                    format!("request body exceeds {}", config.server.max_body),
-                );
-            }
-            Err(_) => {
-                return error(
-                    StatusCode::REQUEST_TIMEOUT,
-                    "invalid_request_error",
-                    "the request body did not arrive in time".into(),
-                );
-            }
-        };
+    let (identity, bytes, body) = match identity_result {
+        IdentifyResult::Identified(identity) => (identity, Bytes::new(), Value::Null),
+        IdentifyResult::NeedsBody(state) => {
+            let bytes =
+                match tokio::time::timeout(config.server.body_timeout.0, to_bytes(body, max_body)).await {
+                    Ok(Ok(bytes)) => bytes,
+                    Ok(Err(_)) => {
+                        return Err(error(
+                            StatusCode::PAYLOAD_TOO_LARGE,
+                            "invalid_request_error",
+                            format!("request body exceeds {}", config.server.max_body),
+                        ));
+                    }
+                    Err(_) => {
+                        return Err(error(
+                            StatusCode::REQUEST_TIMEOUT,
+                            "invalid_request_error",
+                            "the request body did not arrive in time".into(),
+                        ));
+                    }
+                };
+            let body = if parts.method == Method::POST {
+                serde_json::from_slice(&bytes).unwrap_or(Value::Null)
+            } else {
+                Value::Null
+            };
+            let identity = live.identify.identify_body(state, &body).map_err(|denied| error(
+                StatusCode::UNAUTHORIZED,
+                "authentication_error",
+                denied.message().into(),
+            ))?;
+            (identity, bytes, body)
+        }
+    };
+
     let mode = config.server.mode;
     if mode != Mode::Bypass
         && is_slot_action(&parts.method, parts.uri.path())
         && !config.server.allow_slot_actions
     {
-        return error(
+        return Err(error(
             StatusCode::FORBIDDEN,
             "permission_error",
             "slot actions are managed by llama-gate (set server.allow_slot_actions to permit them)"
                 .into(),
-        );
+        ));
     }
     let dialect = (mode != Mode::Bypass && parts.method == Method::POST)
         .then(|| state.dialects.find(parts.uri.path()))
         .flatten();
-    let body: Value = if parts.method == Method::POST {
-        serde_json::from_slice(&bytes).unwrap_or(Value::Null)
-    } else {
-        Value::Null
-    };
-    let identify = live.identify.clone();
-    let identity = match identify.identify(&Caller {
-        peer: peer.ip(),
-        headers: &parts.headers,
-        body: &body,
-    }) {
-        Ok(identity) => identity,
-        Err(denied) => {
-            return error(
-                StatusCode::UNAUTHORIZED,
-                "authentication_error",
-                denied.message().into(),
-            );
-        }
-    };
-    let owns_key = identify.owns_key(&parts.headers);
+    let owns_key = live.identify.owns_key(&parts.headers);
     let requested_model = body
         .get("model")
         .and_then(Value::as_str)
@@ -222,9 +224,9 @@ async fn proxy(
     let (Some(dialect), true) = (dialect, body.is_object()) else {
         // Not scheduled: pass through to a server of the requested model.
         let Some(link) = state.backend_for(model) else {
-            return error(StatusCode::BAD_GATEWAY, "server_error", "no backend".into());
+            return Err(error(StatusCode::BAD_GATEWAY, "server_error", "no backend".into()));
         };
-        return relay(
+        return Ok(relay(
             &state,
             &link,
             &parts.method,
@@ -234,25 +236,25 @@ async fn proxy(
             bytes,
             owns_key,
         )
-        .await;
+        .await);
     };
     let Some(model) = model else {
-        return error(
+        return Err(error(
             StatusCode::SERVICE_UNAVAILABLE,
             "server_error",
             "no models are configured".into(),
-        );
+        ));
     };
     // From here the parsed body is all the request needs.
     let size = bytes.len();
     drop(bytes);
     let Some(held) = Held::take(&state.held, size as u64, config.server.max_held_bytes.0) else {
-        return busy(config.queue.retry_after.0);
+        return Ok(busy(config.queue.retry_after.0));
     };
-    generate(
+    Ok(generate(
         state, config, parts, peer, dialect, body, size, held, identity, model, owns_key,
     )
-    .await
+    .await)
 }
 
 /// Bytes of request bodies held by requests in the gate (each keeps its
