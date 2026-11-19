@@ -76,6 +76,10 @@ pub struct ServerInfo {
     /// The name it serves the model under (`--alias`), if set.
     pub alias: Option<String>,
     pub build: Option<String>,
+    /// The loaded weights' size and shape (`/v1/models` meta), which tell
+    /// two files at the same path apart: a re-quantized or fine-tuned model
+    /// dropped in place must not inherit the old one's saved contexts.
+    pub weights: Option<String>,
 }
 
 /// Optional endpoints this server answers.
@@ -223,7 +227,9 @@ impl Server {
             .and_then(|views| views.iter().filter_map(|view| view.context).max())
             .or(context_from_props)
             .ok_or_else(|| ServerError::Invalid("the server reports no context size".into()))?;
+        let weights = self.weights().await;
         Ok(ServerInfo {
+            weights,
             slots,
             slot_context,
             model: props
@@ -426,6 +432,28 @@ impl Server {
             }
             None => format!("{}{path}", self.base),
         }
+    }
+
+    /// The loaded model's size and shape, from `/v1/models` meta, when the
+    /// server reports them.
+    async fn weights(&self) -> Option<String> {
+        let models = self.get_json("/v1/models").await.ok()?;
+        let entries = models.get("data")?.as_array()?;
+        let entry = match &self.model {
+            Some(model) => entries
+                .iter()
+                .find(|entry| entry.get("id").and_then(Value::as_str) == Some(model.as_str()))?,
+            None => entries.first()?,
+        };
+        let meta = entry.get("meta")?;
+        let field = |key: &str| meta.get(key).map_or_else(String::new, Value::to_string);
+        Some(
+            ["size", "n_params", "n_embd", "n_vocab", "n_ctx_train"]
+                .iter()
+                .map(|key| field(key))
+                .collect::<Vec<_>>()
+                .join("/"),
+        )
     }
 
     async fn get_json(&self, path: &str) -> Result<Value, ServerError> {

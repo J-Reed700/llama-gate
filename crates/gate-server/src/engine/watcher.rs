@@ -28,7 +28,12 @@ pub async fn watch_upstream(
         let mut state = server.health().await;
         if state == Health::Ready {
             match server.info().await {
-                Ok(info) => {
+                Ok(mut info) => {
+                    // The weights come from a second, best-effort request: a
+                    // poll where it failed is not a different server.
+                    if info.weights.is_none() {
+                        info.weights = last_info.as_ref().and_then(|last| last.weights.clone());
+                    }
                     let slots = server.slots().await.unwrap_or_default();
                     let task = slots
                         .iter()
@@ -159,13 +164,57 @@ pub(super) fn describe_loaded(backend: &str, loaded: &Loaded) {
     }
 }
 
-/// Content addresses and snapshots are scoped to the model they belong to.
+/// Content addresses and snapshots are scoped to what produced them: the
+/// model file, the weights in it (size and shape, so a file replaced at the
+/// same path starts over), and the server build (whose saved-state format
+/// may change).
 pub fn namespace(info: &ServerInfo) -> String {
-    info.model.clone().unwrap_or_else(|| "unknown-model".into())
+    let mut namespace = info.model.clone().unwrap_or_else(|| "unknown-model".into());
+    for part in [&info.weights, &info.build].into_iter().flatten() {
+        namespace.push('|');
+        namespace.push_str(part);
+    }
+    namespace
 }
 
 impl Handle {
     pub(super) fn upstream(&self, backend: BackendId, change: Upstream) {
         let _ = self.sender.send(Message::Upstream(backend, change));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn info(weights: Option<&str>, build: Option<&str>) -> ServerInfo {
+        ServerInfo {
+            slots: 2,
+            slot_context: 4096,
+            model: Some("/models/m.gguf".into()),
+            alias: None,
+            build: build.map(str::to_owned),
+            weights: weights.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn a_model_replaced_at_the_same_path_is_another_namespace() {
+        let original = namespace(&info(Some("19000000000/27000000000"), Some("b1-34ef0ef")));
+        assert_eq!(
+            original,
+            namespace(&info(Some("19000000000/27000000000"), Some("b1-34ef0ef")))
+        );
+        assert_ne!(
+            original,
+            namespace(&info(Some("19100000000/27000000000"), Some("b1-34ef0ef"))),
+            "different weights at the same path"
+        );
+        assert_ne!(
+            original,
+            namespace(&info(Some("19000000000/27000000000"), Some("b2-ffffff"))),
+            "another server build may save state differently"
+        );
+        assert_eq!(namespace(&info(None, None)), "/models/m.gguf");
     }
 }
