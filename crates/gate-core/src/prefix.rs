@@ -81,26 +81,39 @@ impl Prefix {
     }
 
     /// Tokens covered by the full blocks the two sequences have in common.
+    ///
+    /// Each hash covers its block and everything before it, so the blocks in
+    /// common are a run from the start, found by binary search: O(log n)
+    /// rather than a walk over every block of a long context.
     pub fn shared(&self, other: &Prefix) -> Tokens {
         if self.is_opaque() || self.block != other.block {
             return 0;
         }
-        let blocks = self
-            .hashes
-            .iter()
-            .zip(other.hashes.iter())
-            .take_while(|(left, right)| left == right)
-            .count();
-        blocks as Tokens * Tokens::from(self.block)
+        // The largest k whose k-th hashes agree (agreement is monotone: once
+        // two chains differ, every later block differs too).
+        let (mut low, mut high) = (0, self.hashes.len().min(other.hashes.len()));
+        while low < high {
+            let middle = low + (high - low).div_ceil(2);
+            if self.hashes[middle - 1] == other.hashes[middle - 1] {
+                low = middle;
+            } else {
+                high = middle - 1;
+            }
+        }
+        low as Tokens * Tokens::from(self.block)
     }
 
     /// Whether `self` is a prefix of `other`: every full block of `self`
-    /// matches, and `other` is at least as long.
+    /// matches, and `other` is at least as long. The last block's hash
+    /// covers all the others, so one comparison decides.
     pub fn is_prefix_of(&self, other: &Prefix) -> bool {
-        !self.is_opaque()
-            && self.block == other.block
-            && self.tokens <= other.tokens
-            && self.shared(other) == self.hashes.len() as Tokens * Tokens::from(self.block)
+        if self.is_opaque() || self.block != other.block || self.tokens > other.tokens {
+            return false;
+        }
+        match self.hashes.len().checked_sub(1) {
+            None => true,
+            Some(last) => other.hashes.get(last) == Some(&self.hashes[last]),
+        }
     }
 
     /// The first `tokens` tokens of this sequence, such as the part of a
@@ -150,6 +163,44 @@ mod tests {
             "blocks 0..4 match, block 4 differs"
         );
         assert_eq!(left.shared(&left), 896, "only full blocks are hashed");
+    }
+
+    #[test]
+    fn shared_and_is_prefix_of_agree_with_the_tokens_everywhere() {
+        // Every pair of lengths and every point of difference, against the
+        // definition: full blocks before the first differing token.
+        let block = 4;
+        let base = sequence(41, 11);
+        for left_length in 0..=base.len() {
+            for right_length in 0..=base.len() {
+                for differ in 0..=right_length {
+                    let left = &base[..left_length];
+                    let mut right = base[..right_length].to_vec();
+                    if let Some(token) = right.get_mut(differ) {
+                        *token += 1;
+                    }
+                    let common = left
+                        .iter()
+                        .zip(&right)
+                        .take_while(|(a, b)| a == b)
+                        .count();
+                    let (lp, rp) = (
+                        Prefix::from_tokens(left, block),
+                        Prefix::from_tokens(&right, block),
+                    );
+                    assert_eq!(
+                        lp.shared(&rp),
+                        (common / block * block) as Tokens,
+                        "lengths {left_length}/{right_length}, differing at {differ}"
+                    );
+                    assert_eq!(
+                        lp.is_prefix_of(&rp),
+                        left_length <= right_length && common >= left_length / block * block,
+                        "lengths {left_length}/{right_length}, differing at {differ}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
