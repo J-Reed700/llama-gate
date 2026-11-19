@@ -222,17 +222,20 @@ impl Gate {
             )),
         };
         let state = Arc::new(AppState {
-            config: RwLock::new(config.clone()),
+            live: RwLock::new(Arc::new(http::Live {
+                config: config.clone(),
+                identify,
+            })),
             handle: handle.clone(),
             backends,
             models,
             dialects,
-            identify: RwLock::new(identify),
             names,
             custom_identify,
             tickets: AtomicU64::new(0),
             held: Arc::default(),
             source,
+            reloading: tokio::sync::Mutex::new(()),
         });
         if !custom_identify {
             // Rule host names are re-resolved so recreated containers keep

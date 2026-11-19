@@ -47,12 +47,13 @@ use relay::*;
 use session::*;
 
 pub struct AppState {
-    pub config: RwLock<Arc<Config>>,
+    /// The configuration and the identification built from it, replaced
+    /// together on reload so a request never sees one without the other.
+    pub live: RwLock<Arc<Live>>,
     pub handle: Handle,
     pub backends: Vec<Arc<BackendLink>>,
     pub models: Arc<Models>,
     pub dialects: Dialects,
-    pub identify: RwLock<Arc<dyn Identify>>,
     /// Client names, kept across reloads.
     pub names: Arc<Mutex<Names>>,
     /// The program supplied its own identification: reloads keep it.
@@ -62,21 +63,40 @@ pub struct AppState {
     pub held: Arc<AtomicU64>,
     /// The configuration file, for reloads.
     pub source: Option<PathBuf>,
+    /// Reloads run one at a time.
+    pub reloading: tokio::sync::Mutex<()>,
+}
+
+/// What a request is served under: one configuration and its rules.
+pub struct Live {
+    pub config: Arc<Config>,
+    pub identify: Arc<dyn Identify>,
 }
 
 impl AppState {
-    pub fn config(&self) -> Arc<Config> {
-        self.config
+    /// The configuration and identification in force, as one snapshot.
+    pub fn live(&self) -> Arc<Live> {
+        self.live
             .read()
-            .map(|config| config.clone())
+            .map(|live| live.clone())
             .unwrap_or_else(|poisoned| poisoned.into_inner().clone())
     }
 
+    pub fn config(&self) -> Arc<Config> {
+        self.live().config.clone()
+    }
+
     pub fn identify(&self) -> Arc<dyn Identify> {
-        self.identify
-            .read()
-            .map(|identify| identify.clone())
-            .unwrap_or_else(|poisoned| poisoned.into_inner().clone())
+        self.live().identify.clone()
+    }
+
+    /// Puts a reloaded configuration and its rules in force together.
+    pub fn replace(&self, live: Live) {
+        let mut current = self
+            .live
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *current = Arc::new(live);
     }
 
     /// A backend of `model` to measure with or forward to: an online one
@@ -125,10 +145,13 @@ async fn proxy(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     request: Request,
 ) -> Response {
-    let config = state.config();
+    // One snapshot for the whole request: a reload meanwhile cannot pair
+    // this configuration with other rules.
+    let live = state.live();
+    let config = live.config.clone();
     let (parts, body) = request.into_parts();
     // A caller the gate will refuse anyway does not get to send a body.
-    if let Err(denied) = state.identify().precheck(&parts.headers) {
+    if let Err(denied) = live.identify.precheck(&parts.headers) {
         return error(
             StatusCode::UNAUTHORIZED,
             "authentication_error",
@@ -174,7 +197,7 @@ async fn proxy(
     } else {
         Value::Null
     };
-    let identify = state.identify();
+    let identify = live.identify.clone();
     let identity = match identify.identify(&Caller {
         peer: peer.ip(),
         headers: &parts.headers,

@@ -44,7 +44,7 @@ mod report;
 mod view;
 mod watcher;
 
-pub use reload::scheduler_config;
+pub use reload::{restart_notes, scheduler_config};
 pub use watcher::{namespace, watch_upstream};
 
 /// The answer to a waiting request.
@@ -598,6 +598,15 @@ impl Engine {
             control,
             reply,
         } = arrival;
+        // Classes are matched by name: a reload between the request's
+        // identification and now may have renumbered them.
+        let mut demand = demand;
+        demand.class = self
+            .class_names
+            .iter()
+            .position(|name| **name == *class)
+            .and_then(|index| u16::try_from(index).ok())
+            .map_or(demand.class, ClassId);
         self.metrics.count(
             "llama_gate_prompt_tokens_total",
             labels(&[("measurement", measured)]),

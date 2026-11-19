@@ -75,6 +75,28 @@ pub trait Dialect: Send + Sync + std::fmt::Debug {
         Wire::Opaque
     }
 
+    /// An error as this API reports one inside a stream that has begun
+    /// (the status line is already sent), framed as a server-sent event.
+    fn error_event(&self, kind: &str, message: &str) -> String {
+        match self.wire() {
+            // `event: error` with Anthropic's error envelope.
+            Wire::Anthropic => format!(
+                "event: error\ndata: {}\n\n",
+                json!({"type": "error", "error": {"type": kind, "message": message}})
+            ),
+            // The Responses API's typed `error` event.
+            Wire::Responses => format!(
+                "event: error\ndata: {}\n\n",
+                json!({"type": "error", "code": kind, "message": message, "param": null})
+            ),
+            // OpenAI and llama.cpp: an `error` object, as llama.cpp sends.
+            _ => format!(
+                "data: {}\n\n",
+                json!({"error": {"type": kind, "message": message}})
+            ),
+        }
+    }
+
     /// Whether the server runs the request in the slot named by `id_slot`.
     /// For endpoints that pick a slot themselves, the gate reserves room
     /// that holds wherever the server puts the request.
@@ -1003,6 +1025,33 @@ mod tests {
                 Prompt::Text("q\nd1".into()),
                 Prompt::Text("q\nd2".into())
             ])
+        );
+    }
+
+    #[test]
+    fn errors_inside_a_stream_are_framed_as_each_api_expects() {
+        use crate::stream::{Kind, Reader};
+        for dialect in [
+            &OpenAiChat as &dyn Dialect,
+            &AnthropicMessages,
+            &OpenAiResponses,
+            &NativeCompletion,
+        ] {
+            let event = dialect.error_event("server_error", "the scheduler stopped");
+            let mut reader = Reader::new(dialect.wire());
+            let pieces = reader.read(event.as_bytes());
+            assert_eq!(pieces.len(), 1, "{}: one whole event", dialect.name());
+            assert!(
+                matches!(&pieces[0].kind, Kind::Error(message) if message == "the scheduler stopped"),
+                "{}: read back as the failure it reports: {:?}",
+                dialect.name(),
+                pieces[0].kind
+            );
+        }
+        assert!(
+            AnthropicMessages
+                .error_event("overloaded_error", "busy")
+                .starts_with("event: error\n")
         );
     }
 }

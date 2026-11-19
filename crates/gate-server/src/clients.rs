@@ -143,10 +143,28 @@ pub struct Names {
     ids: HashMap<Arc<str>, ClientId>,
 }
 
+/// Distinct client names the gate tracks. Names can come from headers, the
+/// body's `user` field, or peer addresses; past this many, further ones
+/// share one identity (and one fair share) instead of growing every table
+/// keyed by client without bound.
+pub const MAX_CLIENTS: usize = 4096;
+
+/// The identity names beyond [`MAX_CLIENTS`] share.
+pub const OVERFLOW_CLIENT: &str = "(other)";
+
 impl Names {
     fn intern(&mut self, name: &str) -> (ClientId, Arc<str>) {
         if let Some((name, id)) = self.ids.get_key_value(name) {
             return (*id, name.clone());
+        }
+        if self.ids.len() >= MAX_CLIENTS && name != OVERFLOW_CLIENT {
+            if !self.ids.contains_key(OVERFLOW_CLIENT) {
+                tracing::warn!(
+                    limit = MAX_CLIENTS,
+                    "too many distinct clients; further ones share the identity \"(other)\""
+                );
+            }
+            return self.intern(OVERFLOW_CLIENT);
         }
         let id = ClientId(self.ids.len() as u32);
         let name: Arc<str> = Arc::from(name);
@@ -668,5 +686,23 @@ mod tests {
             rules.is_admin(&headers),
             "a holder of one of its keys may look"
         );
+    }
+
+    #[test]
+    fn distinct_clients_are_bounded() {
+        let mut names = Names::default();
+        let first = names.intern("client-0");
+        for n in 1..MAX_CLIENTS {
+            names.intern(&format!("client-{n}"));
+        }
+        let (overflow, name) = names.intern("one-too-many");
+        assert_eq!(&*name, OVERFLOW_CLIENT);
+        assert_eq!(
+            names.intern("another").0,
+            overflow,
+            "they share one identity"
+        );
+        assert_eq!(names.intern("client-0"), first, "known names keep theirs");
+        assert_eq!(names.ids.len(), MAX_CLIENTS + 1);
     }
 }

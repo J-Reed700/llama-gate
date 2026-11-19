@@ -2,11 +2,6 @@
 
 use super::*;
 
-pub(super) fn sse_error(kind: &str, message: &str) -> Bytes {
-    let event = json!({"error": {"message": message, "type": kind}});
-    Bytes::from(format!("data: {event}\n\n"))
-}
-
 /// Status, error type, and message for a refusal.
 pub(super) fn describe(rejection: &Rejection) -> (StatusCode, &'static str, String) {
     match rejection {

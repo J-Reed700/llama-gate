@@ -433,7 +433,7 @@ impl Session {
                         })
                         .unwrap_or(text);
                     let _ = sender
-                        .send(Ok(sse_error(
+                        .send(Ok(self.dialect_error(
                             "server_error",
                             &format!("HTTP {status}: {message}"),
                         )))
@@ -488,7 +488,7 @@ impl Session {
                         }
                         Some(Some(Err(error))) => {
                             let _ = sender
-                                .send(Ok(sse_error("server_error", &error.to_string())))
+                                .send(Ok(self.dialect_error("server_error", &error.to_string())))
                                 .await;
                             self.close("error", 502, None);
                             return;
@@ -515,7 +515,9 @@ impl Session {
             // a bounce), pinging the client meanwhile.
             let Some(mut receiver) = grant.take() else {
                 let _ = sender
-                    .send(Ok(sse_error("server_error", "the request lost its place")))
+                    .send(Ok(
+                        self.dialect_error("server_error", "the request lost its place")
+                    ))
                     .await;
                 self.close("error", 500, None);
                 return;
@@ -550,26 +552,35 @@ impl Session {
                         grant = Some(next);
                     }
                     Attempt::Failed(message) => {
-                        let _ = sender.send(Ok(sse_error("server_error", &message))).await;
+                        let _ = sender
+                            .send(Ok(self.dialect_error("server_error", &message)))
+                            .await;
                         self.close("error", 502, None);
                         return;
                     }
                 },
                 Ok(Grant::Refused(rejection)) => {
                     let (status, kind, message) = describe(&rejection);
-                    let _ = sender.send(Ok(sse_error(kind, &message))).await;
+                    let _ = sender.send(Ok(self.dialect_error(kind, &message))).await;
                     self.close("refused", status.as_u16(), None);
                     return;
                 }
                 Err(_) => {
                     let _ = sender
-                        .send(Ok(sse_error("server_error", "the scheduler stopped")))
+                        .send(Ok(
+                            self.dialect_error("server_error", "the scheduler stopped")
+                        ))
                         .await;
                     self.close("error", 503, None);
                     return;
                 }
             }
         }
+    }
+
+    /// An error inside a stream that has begun, as the request's API frames it.
+    fn dialect_error(&self, kind: &str, message: &str) -> Bytes {
+        Bytes::from(self.dialect.error_event(kind, message))
     }
 
     fn refuse(mut self, rejection: &Rejection) -> Response {

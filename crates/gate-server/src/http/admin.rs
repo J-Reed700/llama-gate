@@ -142,17 +142,26 @@ pub async fn apply_reload(state: &AppState) -> Result<Vec<String>, String> {
     let Some(path) = &state.source else {
         return Err("the gate was not started from a configuration file".into());
     };
-    let text = std::fs::read_to_string(path)
+    // One reload at a time: a SIGHUP and a POST together would otherwise
+    // leave the engine and the request path on different files.
+    let _one_at_a_time = state.reloading.lock().await;
+    let text = tokio::fs::read_to_string(path)
+        .await
         .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
     let mut config = Config::from_toml(&text)?;
-    let current = state.config();
-    // Command-line overrides of these stay in force.
-    config.server.listen = current.server.listen;
-    config.server.upstream = current.server.upstream.clone();
-    config.server.mode = current.server.mode;
+    let current = state.live();
+    let mut notes = crate::engine::restart_notes(&current.config, &config);
+    // These are fixed for the gate's life (some may come from the command
+    // line): the notes say when the file asks for others.
+    config.server.listen = current.config.server.listen;
+    config.server.upstream = current.config.server.upstream.clone();
+    config.server.mode = current.config.server.mode;
     let config = Arc::new(config);
-    let notes = state.handle.reconfigure(config.clone()).await?;
-    if !state.custom_identify {
+    // The slow part first (resolving host names), so the engine and the
+    // request path switch over at nearly the same moment.
+    let identify: Arc<dyn Identify> = if state.custom_identify {
+        current.identify.clone()
+    } else {
         let rules = crate::clients::Rules::new(
             &config.clients,
             &config.auth,
@@ -160,13 +169,10 @@ pub async fn apply_reload(state: &AppState) -> Result<Vec<String>, String> {
             state.names.clone(),
         );
         rules.resolve().await;
-        if let Ok(mut identify) = state.identify.write() {
-            *identify = Arc::new(rules);
-        }
-    }
-    if let Ok(mut current) = state.config.write() {
-        *current = config;
-    }
+        Arc::new(rules)
+    };
+    notes.extend(state.handle.reconfigure(config.clone()).await?);
+    state.replace(Live { config, identify });
     Ok(notes)
 }
 
