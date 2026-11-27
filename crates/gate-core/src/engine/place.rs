@@ -52,6 +52,8 @@ struct Choice {
     exclusive: bool,
     /// Requests already on this backend.
     busy: usize,
+    /// Estimated time-to-first-token (ms), used for TTFT-aware placement.
+    est_ttft_ms: u64,
     /// The backend's usage, in millionths of its capacity.
     load: u64,
     /// For a context to clear: the eviction policy's view (higher keeps it).
@@ -59,14 +61,15 @@ struct Choice {
 }
 
 impl Choice {
-    /// Orders choices from worst to best. In turn: fits now; reuses an
-    /// appreciably larger part of the prompt; runs on a less busy backend;
-    /// reuses more; destroys no context; destroys the policy's first
+    /// Orders choices from worst to best. In turn: fits now; coarse TTFT
+    /// bucket (128ms); hot VRAM over cold disk restore; runs on a less busy
+    /// backend; reuses more; destroys no context; destroys the policy's first
     /// victim; runs on a less full backend; the lowest slot.
     fn compare(left: &Choice, right: &Choice) -> Ordering {
         left.fits
             .cmp(&right.fits)
-            .then((left.reuse.tokens >> 10).cmp(&(right.reuse.tokens >> 10)))
+            .then((right.est_ttft_ms >> 7).cmp(&(left.est_ttft_ms >> 7)))
+            .then(left.restore.is_none().cmp(&right.restore.is_none()))
             .then(right.busy.cmp(&left.busy))
             .then(left.reuse.tokens.cmp(&right.reuse.tokens))
             .then((!left.clear).cmp(&!right.clear))
@@ -122,7 +125,7 @@ impl Scheduler {
                 let model = self.waiting[index].demand.model;
                 let Some(&head) = heads.get(&model) else {
                     heads.insert(model, index);
-                    match self.plan(index, true) {
+                    match self.plan(index, true, now) {
                         Plan::Place(placement) => {
                             self.commit(index, placement, now, out);
                             continue 'pass;
@@ -136,11 +139,11 @@ impl Scheduler {
                             continue 'pass;
                         }
                         Plan::MakeRoom(victims) => {
-                            self.make_room(&victims, out);
+                            self.make_room(&victims, now, out);
                             held.insert(model);
                         }
                         Plan::Preempt(preemption) => {
-                            self.make_room(&preemption.evict, out);
+                            self.make_room(&preemption.evict, now, out);
                             for victim in preemption.victims {
                                 self.preempt(victim, out);
                             }
@@ -152,21 +155,35 @@ impl Scheduler {
                 };
                 // The head is waiting for running work to finish. Requests
                 // small enough to use what is free right now may run first,
-                // until the head has waited for the backfill window.
+                // until the head has waited for the backfill window (and when
+                // running slots have speed estimates, only if the backfill is
+                // expected to finish within the head's shadow time).
                 let Some(backfill) = self.config.backfill else {
                     continue;
                 };
+                let waited = now.saturating_sub(self.waiting[head].arrived);
                 if held.contains(&model)
                     || self.model_freeing(model)
-                    || now.saturating_sub(self.waiting[head].arrived) >= backfill.window
+                    || waited >= backfill.window
                     || self.waiting[index].demand.need() > backfill.max_tokens
                 {
                     continue;
                 }
-                if let Plan::Place(placement) = self.plan(index, false) {
-                    self.commit(index, placement, now, out);
-                    continue 'pass;
+                let Plan::Place(placement) = self.plan(index, false, now) else {
+                    continue;
+                };
+                if let Some(shadow_ms) = self.head_shadow_ms(&self.waiting[head].demand, now) {
+                    let remaining_window = backfill.window.saturating_sub(waited);
+                    let allowed_ms = shadow_ms.max(remaining_window);
+                    if let Some(runtime_ms) =
+                        self.est_runtime_ms(&self.waiting[index].demand, &placement)
+                        && runtime_ms > allowed_ms
+                    {
+                        continue;
+                    }
                 }
+                self.commit(index, placement, now, out);
+                continue 'pass;
             }
             return;
         }
@@ -216,7 +233,7 @@ impl Scheduler {
             .any(|backend| backend.serves(model) && backend.pool.any_freeing())
     }
 
-    fn plan(&self, index: usize, allow_eviction: bool) -> Plan {
+    fn plan(&self, index: usize, allow_eviction: bool, now: Millis) -> Plan {
         let demand = &self.waiting[index].demand;
         let floor = demand.prompt.saturating_add(demand.min_generation);
         // The model's largest backend decides whether the prompt can ever
@@ -252,7 +269,7 @@ impl Scheduler {
                         state,
                         snapshot,
                     };
-                    options.push(self.option(place, demand, generation, limit));
+                    options.push(self.option(place, demand, generation, limit, now));
                 }
             }
         }
@@ -264,19 +281,26 @@ impl Scheduler {
             return Plan::Wait;
         }
         for option in options.iter().rev() {
-            match self.room_for(option, option.exclusive) {
+            match self.room_for(option, option.exclusive, now) {
                 Room::Coming => return Plan::Wait,
                 Room::Evict(victims) => return Plan::MakeRoom(victims),
                 Room::Blocked => {}
             }
         }
-        match self.preemption(index) {
+        match self.preemption(index, now) {
             Some(preemption) => Plan::Preempt(preemption),
             None => Plan::Wait,
         }
     }
 
-    fn option(&self, site: Site<'_>, demand: &Demand, generation: Tokens, limit: Tokens) -> Choice {
+    fn option(
+        &self,
+        site: Site<'_>,
+        demand: &Demand,
+        generation: Tokens,
+        limit: Tokens,
+        now: Millis,
+    ) -> Choice {
         let Site {
             slot,
             backend,
@@ -316,62 +340,84 @@ impl Scheduler {
         let restore = snapshot.filter(|(_, covered)| {
             demand.pinned && *covered >= kept_reuse.saturating_add(policy.min_restore_gain)
         });
-        let clear = resident.is_some() && (in_place.is_none() || restore.is_some());
-        // Reusing part of a context in place truncates the rest; save it
-        // first when the rest is worth keeping.
-        let save_first = !clear
-            && in_place.is_some_and(|reuse| reuse.partial)
-            && resident.is_some_and(|resident| {
-                worth_saving(policy, backend.swap, resident)
-                    && resident.tokens.saturating_sub(kept_reuse) >= policy.min_snapshot_tokens
-            });
         let holding = state.usage();
-        let kept = if clear { 0 } else { holding };
-        // A snapshot holds its conversation's prompt and generated answer, so
-        // restoring it can briefly hold more than this request needs (for
-        // example when the conversation was rewound).
-        let restored = restore.map_or(0, |(meta, _)| meta.tokens);
-        let reserved = if exclusive {
-            limit
-        } else {
-            need.max(kept).max(restored)
+        let busy = backend.pool.busy();
+        let load = backend.load();
+        let build = |restore: Option<(&SnapshotMeta, Tokens)>| {
+            let clear = resident.is_some() && (in_place.is_none() || restore.is_some());
+            // Reusing part of a context in place truncates the rest; save it
+            // first when the rest is worth keeping.
+            let save_first = !clear
+                && in_place.is_some_and(|reuse| reuse.partial)
+                && resident.is_some_and(|resident| {
+                    worth_saving(policy, backend.swap, resident)
+                        && resident.tokens.saturating_sub(kept_reuse) >= policy.min_snapshot_tokens
+                });
+            let kept = if clear { 0 } else { holding };
+            // A snapshot holds its conversation's prompt and generated answer, so
+            // restoring it can briefly hold more than this request needs (for
+            // example when the conversation was rewound).
+            let restored = restore.map_or(0, |(meta, _)| meta.tokens);
+            let reserved = if exclusive {
+                limit
+            } else {
+                need.max(kept).max(restored)
+            };
+            let peak = reserved.max(holding);
+            let fits = backend.pool.fits(slot.index, peak)
+                && (!exclusive || backend.pool.others_usage_is_zero(slot.index));
+            let reuse = match restore {
+                Some((meta, covered)) => Reuse {
+                    tokens: covered,
+                    partial: !meta.prefix.is_prefix_of(&demand.prefix),
+                },
+                None if clear => Reuse::default(),
+                None => in_place.unwrap_or_default(),
+            };
+            let clearing_save = clear
+                && resident.is_some_and(|resident| worth_saving(policy, backend.swap, resident));
+            let est_ttft_ms = estimate_ttft_ms(
+                backend,
+                demand.prompt.saturating_sub(reuse.tokens),
+                restore.is_some(),
+                save_first || clearing_save,
+                busy,
+            );
+            // Prefer keeping contexts; among contexts to clear, the policy's
+            // first victim.
+            let victim = resident.filter(|_| clear).map_or(f64::MAX, |resident| {
+                -self.victims.rank_at(slot, resident, now)
+            });
+            Choice {
+                slot,
+                generation,
+                fits,
+                peak,
+                reserved,
+                clear,
+                save_first,
+                restore: restore.map(|(meta, _)| meta.id),
+                reuse,
+                exclusive,
+                busy,
+                est_ttft_ms,
+                load,
+                victim,
+            }
         };
-        let peak = reserved.max(holding);
-        let fits = backend.pool.fits(slot.index, peak)
-            && (!exclusive || backend.pool.others_usage_is_zero(slot.index));
-        let reuse = match restore {
-            Some((meta, covered)) => Reuse {
-                tokens: covered,
-                partial: !meta.prefix.is_prefix_of(&demand.prefix),
-            },
-            None if clear => Reuse::default(),
-            None => in_place.unwrap_or_default(),
-        };
-        // Prefer keeping contexts; among contexts to clear, the policy's
-        // first victim.
-        let victim = resident
-            .filter(|_| clear)
-            .map_or(f64::MAX, |resident| -self.victims.rank(slot, resident));
-        Choice {
-            slot,
-            generation,
-            fits,
-            peak,
-            reserved,
-            clear,
-            save_first,
-            restore: restore.map(|(meta, _)| meta.id),
-            reuse,
-            exclusive,
-            busy: backend.pool.busy(),
-            load: backend.load(),
-            victim,
+        let with_restore = build(restore);
+        if restore.is_some() && in_place.is_some() {
+            let in_place_only = build(None);
+            if Choice::compare(&in_place_only, &with_restore) == Ordering::Greater {
+                return in_place_only;
+            }
         }
+        with_restore
     }
 
     /// Whether evicting idle contexts in other slots of the option's backend
     /// would let it fit.
-    fn room_for(&self, option: &Choice, exclusive: bool) -> Room {
+    fn room_for(&self, option: &Choice, exclusive: bool, now: Millis) -> Room {
         let Some(backend) = self.backend(option.slot.backend) else {
             return Room::Blocked;
         };
@@ -428,8 +474,8 @@ impl Scheduler {
         let mut still = deficit - freeing;
         idle.sort_by(|left, right| {
             self.victims
-                .rank(left.0, left.1)
-                .total_cmp(&self.victims.rank(right.0, right.1))
+                .rank_at(left.0, left.1, now)
+                .total_cmp(&self.victims.rank_at(right.0, right.1, now))
         });
         let mut victims = Vec::new();
         for (slot, resident) in idle {
@@ -468,7 +514,7 @@ impl Scheduler {
     /// `index` can run on one of its backends, if pausing lower-priority
     /// work that has produced no output can make the room. Fewest paused
     /// requests first, then least paused work.
-    fn preemption(&self, index: usize) -> Option<Preemption> {
+    fn preemption(&self, index: usize, now: Millis) -> Option<Preemption> {
         let demand = &self.waiting[index].demand;
         if demand.exclusive || !demand.pinned {
             return None;
@@ -520,8 +566,8 @@ impl Scheduler {
                 .collect();
             idle.sort_by(|left, right| {
                 self.victims
-                    .rank(slot_id(left.0), left.1)
-                    .total_cmp(&self.victims.rank(slot_id(right.0), right.1))
+                    .rank_at(slot_id(left.0), left.1, now)
+                    .total_cmp(&self.victims.rank_at(slot_id(right.0), right.1, now))
             });
             // Where the request would run: an empty slot, else the idle slot
             // the policy gives up first, else the first victim's.
@@ -654,6 +700,8 @@ impl Scheduler {
                 holding,
                 preparation,
                 op,
+                op_started_at: now,
+                op_telemetry: true,
                 abandoned: false,
                 reuse,
             })),
@@ -677,7 +725,15 @@ impl Scheduler {
             waiting.charged = true;
             let demand = &waiting.demand;
             if let Some(class) = self.config.classes.get(usize::from(demand.class.0)) {
-                self.order.served_prompt(demand.client, class, demand.work);
+                let cached = reuse.tokens.min(demand.work);
+                let uncached = demand.work - cached;
+                if uncached > 0 || demand.work == 0 {
+                    self.order.served_prompt(demand.client, class, uncached);
+                }
+                if cached > 0 {
+                    self.order
+                        .served_cached_prompt(demand.client, class, cached);
+                }
             }
         }
         let ticket = waiting.ticket;
@@ -689,8 +745,10 @@ impl Scheduler {
                 waiting,
                 reserved,
                 since: now,
+                started_at: None,
                 reuse,
                 started: false,
+                telemetry: true,
             })),
         );
         out.push(Command::Dispatch {
@@ -702,7 +760,7 @@ impl Scheduler {
         });
     }
 
-    fn make_room(&mut self, victims: &[SlotId], out: &mut Vec<Command>) {
+    fn make_room(&mut self, victims: &[SlotId], now: Millis, out: &mut Vec<Command>) {
         let policy = self.config.eviction;
         for &slot in victims {
             let op = self.next_op();
@@ -715,7 +773,13 @@ impl Scheduler {
                 SlotState::Idle(resident) => {
                     let save = worth_saving(&policy, swap, &resident)
                         .then(|| backend.snapshots.allocate());
-                    backend.pool.slots[slot.index] = SlotState::Evicting { resident, save, op };
+                    backend.pool.slots[slot.index] = SlotState::Evicting {
+                        resident,
+                        save,
+                        op,
+                        op_started_at: now,
+                        op_telemetry: true,
+                    };
                     out.push(Command::Evict { slot, save, op });
                 }
                 other => backend.pool.slots[slot.index] = other,
@@ -757,4 +821,238 @@ impl Scheduler {
             op,
         });
     }
+
+    /// Estimates the earliest time (ms from `now`) that running work on some
+    /// serving backend with known speed estimates will free enough room for
+    /// `head_demand`. Returns `None` when no serving backend's running work is
+    /// estimable.
+    fn head_shadow_ms(&self, head_demand: &Demand, now: Millis) -> Option<Millis> {
+        let floor = head_demand
+            .prompt
+            .saturating_add(head_demand.min_generation);
+        let mut best: Option<Millis> = None;
+        for backend in &self.backends {
+            let limit = backend.pool.layout.request_limit();
+            if !backend.serves(head_demand.model) || floor > limit {
+                continue;
+            }
+            let exclusive = head_demand.exclusive
+                || (!head_demand.pinned && matches!(backend.pool.layout, Layout::Unified { .. }));
+            let mut running_slots: Vec<(Millis, Tokens)> = Vec::new();
+            let mut estimable = true;
+            let mut available_slots = 0usize;
+            let mut fixed_usage = backend.pool.stray;
+            let mut faulted = false;
+            for state in &backend.pool.slots {
+                match state {
+                    SlotState::Empty | SlotState::Idle(_) => available_slots += 1,
+                    SlotState::Running(_) | SlotState::Preparing(_) => {
+                        let Some(entry) = self.slot_remaining_ms(backend, state, now) else {
+                            estimable = false;
+                            break;
+                        };
+                        running_slots.push(entry);
+                    }
+                    SlotState::Faulted { holding, .. } => {
+                        faulted = true;
+                        fixed_usage = fixed_usage.saturating_add(*holding);
+                    }
+                    SlotState::Evicting { .. } | SlotState::Preempting { .. } => {
+                        fixed_usage = fixed_usage.saturating_add(state.usage());
+                    }
+                }
+            }
+            if !estimable || running_slots.is_empty() {
+                continue;
+            }
+            running_slots.sort_by_key(|(rem_ms, _)| *rem_ms);
+            let candidate = match backend.pool.layout {
+                Layout::Unified { capacity } => {
+                    if exclusive {
+                        if backend.pool.stray > 0 || faulted {
+                            None
+                        } else {
+                            running_slots.iter().map(|(rem_ms, _)| *rem_ms).max()
+                        }
+                    } else {
+                        let head_gen = head_demand.generation.min(capacity - head_demand.prompt);
+                        let head_need = (head_demand.prompt + head_gen + backend.overrun)
+                            .min(capacity.max(head_demand.prompt + head_gen));
+                        let running_usage: Tokens = running_slots
+                            .iter()
+                            .map(|(_, tokens)| *tokens)
+                            .fold(0, Tokens::saturating_add);
+                        let non_evictable = fixed_usage.saturating_add(running_usage);
+                        let deficit = non_evictable
+                            .saturating_add(head_need)
+                            .saturating_sub(capacity);
+                        let mut freed: Tokens = 0;
+                        let mut freed_slots = 0usize;
+                        let mut found = None;
+                        for (rem_ms, tokens) in &running_slots {
+                            freed = freed.saturating_add(*tokens);
+                            freed_slots += 1;
+                            if freed >= deficit && (available_slots > 0 || freed_slots > 0) {
+                                found = Some(*rem_ms);
+                                break;
+                            }
+                        }
+                        found
+                    }
+                }
+                Layout::Split { .. } => {
+                    if exclusive {
+                        running_slots.iter().map(|(rem_ms, _)| *rem_ms).max()
+                    } else {
+                        Some(running_slots[0].0)
+                    }
+                }
+            };
+            if let Some(time) = candidate {
+                best = Some(best.map_or(time, |current| current.min(time)));
+            }
+        }
+        best
+    }
+
+    fn slot_remaining_ms(
+        &self,
+        backend: &Backend,
+        state: &SlotState,
+        now: Millis,
+    ) -> Option<(Millis, Tokens)> {
+        match state {
+            SlotState::Running(running) => {
+                let exp_gen = self.expected_generation(
+                    running.waiting.demand.class,
+                    running.waiting.demand.generation,
+                );
+                let decode_ms = if exp_gen == 0 {
+                    0
+                } else {
+                    if !backend.decode_observed {
+                        return None;
+                    }
+                    (u128::from(exp_gen) * 1000).div_ceil(u128::from(backend.decode_tps.max(1)))
+                };
+                let rem = if let Some(started_at) = running.started_at {
+                    let elapsed = u128::from(now.saturating_sub(started_at));
+                    decode_ms.saturating_sub(elapsed)
+                } else {
+                    let uncached = running
+                        .waiting
+                        .demand
+                        .prompt
+                        .saturating_sub(running.reuse.tokens);
+                    let prefill_ms = if uncached == 0 {
+                        0
+                    } else {
+                        if !backend.prefill_observed {
+                            return None;
+                        }
+                        (u128::from(uncached) * 1000)
+                            .div_ceil(u128::from(backend.prefill_tps.max(1)))
+                    };
+                    let elapsed = u128::from(now.saturating_sub(running.since));
+                    prefill_ms.saturating_add(decode_ms).saturating_sub(elapsed)
+                };
+                Some((u64::try_from(rem).unwrap_or(u64::MAX), running.reserved))
+            }
+            SlotState::Preparing(claim) => {
+                if !backend.has_speed_estimate() {
+                    return None;
+                }
+                let op_elapsed = now.saturating_sub(claim.op_started_at);
+                let op_rem = match &claim.preparation {
+                    Preparation::Restoring { .. } => backend.restore_ms.saturating_sub(op_elapsed),
+                    Preparation::Saving { .. } => backend.save_ms.saturating_sub(op_elapsed),
+                    Preparation::Clearing { save, restore, .. } => {
+                        let save_part = if save.is_some() {
+                            backend.save_ms.saturating_sub(op_elapsed)
+                        } else {
+                            0
+                        };
+                        let restore_part = if restore.is_some() {
+                            backend.restore_ms
+                        } else {
+                            0
+                        };
+                        save_part.saturating_add(restore_part)
+                    }
+                };
+                let uncached = claim
+                    .waiting
+                    .demand
+                    .prompt
+                    .saturating_sub(claim.reuse.tokens);
+                let prefill_ms = if uncached == 0 {
+                    0
+                } else {
+                    (u128::from(uncached) * 1000).div_ceil(u128::from(backend.prefill_tps.max(1)))
+                };
+                let exp_gen =
+                    self.expected_generation(claim.waiting.demand.class, claim.generation);
+                let decode_ms = if exp_gen == 0 {
+                    0
+                } else {
+                    (u128::from(exp_gen) * 1000).div_ceil(u128::from(backend.decode_tps.max(1)))
+                };
+                let total = u128::from(op_rem)
+                    .saturating_add(prefill_ms)
+                    .saturating_add(decode_ms);
+                Some((
+                    u64::try_from(total).unwrap_or(u64::MAX),
+                    claim.reserved.max(claim.holding),
+                ))
+            }
+            _ => None,
+        }
+    }
+
+    fn est_runtime_ms(&self, demand: &Demand, placement: &Placement) -> Option<Millis> {
+        let backend = self.backend(placement.slot.backend)?;
+        let uncached = demand.prompt.saturating_sub(placement.reuse.tokens);
+        let exp_gen = self.expected_generation(demand.class, placement.generation);
+        let clearing_save = placement.clear
+            && matches!(
+                backend.pool.slots.get(placement.slot.index),
+                Some(SlotState::Idle(resident))
+                    if worth_saving(&self.config.eviction, backend.swap, resident)
+            );
+        let busy = backend.pool.busy();
+        let ttft_ms = u128::from(estimate_ttft_ms(
+            backend,
+            uncached,
+            placement.restore.is_some(),
+            placement.save_first || clearing_save,
+            busy,
+        ));
+        let decode_ms = if exp_gen == 0 {
+            0
+        } else {
+            (u128::from(exp_gen) * 1000).div_ceil(u128::from(backend.decode_tps.max(1)))
+        };
+        let total = ttft_ms.saturating_add(decode_ms);
+        Some(u64::try_from(total).unwrap_or(u64::MAX))
+    }
+}
+
+fn estimate_ttft_ms(
+    backend: &Backend,
+    uncached_tokens: Tokens,
+    has_restore: bool,
+    has_save: bool,
+    busy: usize,
+) -> u64 {
+    let restore_ms = if has_restore { backend.restore_ms } else { 0 };
+    let save_ms = if has_save { backend.save_ms } else { 0 };
+    let io_ms = u128::from(restore_ms).saturating_add(u128::from(save_ms));
+    let prefill_ms = if uncached_tokens == 0 {
+        0
+    } else {
+        (u128::from(uncached_tokens) * 1000).div_ceil(u128::from(backend.prefill_tps.max(1)))
+    };
+    let contention = u128::from(busy as u64).saturating_add(1);
+    let total = io_ms.saturating_add(prefill_ms.saturating_mul(contention));
+    u64::try_from(total).unwrap_or(u64::MAX)
 }

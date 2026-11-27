@@ -17,7 +17,7 @@
 //! - [`QueueOrder`] decides who goes next among equal priorities
 //!   ([`Vtc`] fair queueing or [`Fifo`]).
 //! - [`EvictionOrder`] decides which idle context gives way
-//!   ([`LeastRecentlyUsed`], [`Smallest`], [`Largest`]).
+//!   ([`LeastRecentlyUsed`], [`Smallest`], [`Largest`], [`CostBenefit`]).
 //! - [`Prefix`] content-addresses prompts so a request can be routed to the
 //!   slot, or the saved snapshot, that already holds its prefix.
 //!
@@ -40,7 +40,7 @@ pub use engine::{
     PreemptOutcome, RestoreOutcome, SaveOutcome, Scheduler, SchedulerConfig, SlotStatus, Status,
     WaitingStatus,
 };
-pub use evict::{EvictionOrder, Largest, LeastRecentlyUsed, Smallest};
+pub use evict::{CostBenefit, EvictionOrder, Largest, LeastRecentlyUsed, Smallest};
 pub use pool::{Layout, Resident};
 pub use prefix::Prefix;
 pub use queue::{Candidate, Fifo, QueueOrder, Vtc};

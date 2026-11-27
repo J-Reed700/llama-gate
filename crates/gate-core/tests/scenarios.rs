@@ -3,8 +3,8 @@
 mod support;
 
 use gate_core::{
-    BackendId, Backfill, ClassId, Command, EvictionPolicy, Layout, ModelId, Notice, Prefix,
-    Rejection,
+    BackendId, Backfill, ClassId, Command, CostBenefit, Demand, Event, EvictionPolicy, Layout,
+    ModelId, Notice, Prefix, Rejection, Scheduler, SchedulerConfig, Shape, TicketId, Vtc,
 };
 use support::{BackendSetup, Setup, class, forked, prefix, slot};
 
@@ -803,4 +803,312 @@ fn an_overrun_is_reported_and_reserved_against() {
         77_000 + 77_000,
         "the idle first context plus a padded reservation"
     );
+}
+
+#[test]
+fn hot_vram_beats_cold_disk_restore_when_token_gap_is_small() {
+    // Pool holds 100k across 2 slots. Put a 3,136-token prefix in slot 0 and
+    // a 2,880-token prefix in slot 1 (both sharing the same conversation head).
+    // Evict slot 0 to disk via a large filler request, leaving slot 1 in hot
+    // VRAM. A new 4,000-token continuation must choose hot VRAM (2,880 reuse)
+    // over cold disk restore (3,136 reuse) because TTFT is clearly lower.
+    let mut gate = Setup::unified(100_000, 2).build();
+    let disk_seed = gate.arrive(1, 3_136, 100, prefix(99, 3_136));
+    gate.finish(disk_seed, 64);
+    gate.advance(10);
+    let hot_seed = gate.arrive(2, 2_880, 100, prefix(99, 2_880));
+    gate.finish(hot_seed, 64);
+    let hot_slot = gate.was_dispatched(hot_seed).unwrap().slot;
+
+    // Large filler evicts the older slot (disk_seed) and saves it to disk.
+    let filler = gate.arrive(3, 95_000, 1_000, prefix(50, 95_000));
+    gate.finish(filler, 100);
+    assert_eq!(gate.files[0].len(), 1, "disk_seed was saved to disk");
+
+    // 4,000-token continuation: 3,136 on disk vs 2,880 in hot VRAM.
+    let query = gate.arrive(4, 4_000, 500, forked(99, 3_136, 7, 864));
+    let dispatch = gate.was_dispatched(query).expect("dispatched");
+    assert_eq!(dispatch.slot, hot_slot, "hot VRAM beats cold disk restore");
+    assert_eq!(dispatch.reuse, 2_880);
+}
+
+#[test]
+fn heterogeneous_replicas_route_to_the_faster_backend_and_reset_on_shape_change() {
+    let mut gate = Setup::unified(POOL, 2).replicate().build();
+    let r0 = gate.arrive(1, 5_000, 100, prefix(1, 5_000));
+    let r1 = gate.arrive(2, 5_000, 100, prefix(2, 5_000));
+    let fast_backend = gate.was_dispatched(r0).unwrap().slot.backend;
+    let slow_backend = gate.was_dispatched(r1).unwrap().slot.backend;
+    assert_ne!(fast_backend, slow_backend);
+
+    gate.advance(500); // fast prefill: 5000 in 500ms = 10,000 tok/s
+    gate.start(r0);
+    gate.advance(500);
+    gate.finish(r0, 100); // fast decode: 100 in 500ms = 200 tok/s
+
+    gate.advance(9_000); // slow prefill: 5000 in 10,000ms = 500 tok/s
+    gate.start(r1);
+    gate.advance(5_000);
+    gate.finish(r1, 100); // slow decode: 100 in 5,000ms = 20 tok/s
+
+    // Fresh request with 4,000 tokens goes to fast_backend even though both are idle.
+    let probe = gate.arrive(3, 4_000, 100, prefix(3, 4_000));
+    assert_eq!(
+        gate.was_dispatched(probe).unwrap().slot.backend,
+        fast_backend
+    );
+    gate.finish(probe, 10);
+
+    // Restarting fast_backend while a request is in-flight does not corrupt
+    // telemetry; changing its shape resets its learned speed to the prior.
+    let inflight = gate.arrive(4, 4_000, 100, prefix(4, 4_000));
+    assert_eq!(
+        gate.was_dispatched(inflight).unwrap().slot.backend,
+        fast_backend
+    );
+    gate.advance(60_000);
+    gate.restart(fast_backend.0);
+
+    // Shape change resets fast_backend back to prior (2,000 tok/s); if we make
+    // slow_backend fast (20,000 tok/s) and change fast_backend's shape,
+    // slow_backend now wins.
+    let changed_shape = Shape {
+        model: ModelId(0),
+        layout: Layout::Unified { capacity: POOL },
+        slots: 3, // changed slot count
+        swap: true,
+    };
+    gate.shapes[usize::from(fast_backend.0)] = changed_shape;
+    gate.physical[usize::from(fast_backend.0)].resize(3, 0);
+    gate.feed(Event::BackendUp {
+        backend: fast_backend,
+        shape: changed_shape,
+        restarted: false,
+        snapshots: None,
+        now: gate.now,
+    });
+
+    // Re-calibrate slow_backend to 20,000 tok/s while fast_backend is full.
+    let blocker = gate.arrive(5, POOL - 2_000, 1_000, prefix(5, (POOL - 2_000) as usize));
+    let on_other = gate.arrive(6, 10_000, 100, prefix(6, 10_000));
+    let other_backend = gate.was_dispatched(on_other).unwrap().slot.backend;
+    gate.finish(blocker, 10);
+    assert_eq!(other_backend, slow_backend);
+    gate.advance(500); // 10,000 in 500ms = 20,000 tok/s
+    gate.start(on_other);
+    gate.advance(500);
+    gate.finish(on_other, 100);
+    let after = gate.arrive(7, 4_000, 100, prefix(7, 4_000));
+    assert_eq!(
+        gate.was_dispatched(after).unwrap().slot.backend,
+        slow_backend
+    );
+}
+
+#[test]
+fn cache_aware_vtc_charges_cached_prefix_at_discounted_rate() {
+    let mut gate = Setup::unified(150_000, 2).swap(true).build();
+    let c1_t1 = gate.arrive(1, 50_000, 100, prefix(1, 50_000));
+    gate.finish(c1_t1, 0); // c1 counter = 50,000
+    let c2_t1 = gate.arrive(2, 50_000, 100, prefix(2, 50_000));
+    gate.finish(c2_t1, 0); // c2 counter = 50,000
+
+    // Client 1 turn 2: 51,000 prompt reusing 50,000 in slot 0 -> charged
+    // 1,000 * 1.0 + 50,000 * 0.1 = 6,000 (total 56,000).
+    let c1_t2 = gate.arrive(1, 51_000, 100, forked(1, 50_000, 10, 1_000));
+    assert_eq!(gate.was_dispatched(c1_t2).unwrap().reuse, 50_000);
+    // Queue Client 2's heavy uncached job (100k) and Client 1's next job (80k)
+    // while c1_t2 runs so neither client goes idle.
+    let c2_t2 = gate.arrive(2, 100_000, 100, prefix(20, 100_000));
+    let c1_t3 = gate.arrive(1, 80_000, 100, prefix(11, 80_000));
+    gate.finish(c1_t2, 0);
+
+    // c2_t2 had counter 50,000 < 56,000 so it runs next and accrues 100,000
+    // (total 150,000); c2_t3 arrives before c2_t2 finishes.
+    assert_eq!(
+        gate.scheduler.service(gate_core::ClientId(1)),
+        Some(56_000.0)
+    );
+    assert!(gate.was_dispatched(c2_t2).is_some());
+    let c2_t3 = gate.arrive(2, 80_000, 100, prefix(21, 80_000));
+    gate.finish(c2_t2, 0);
+
+    assert_eq!(
+        gate.scheduler.service(gate_core::ClientId(2)),
+        Some(150_000.0)
+    );
+    assert!(
+        gate.was_dispatched(c1_t3).is_some(),
+        "cached client has lower VTC counter and goes before heavy uncached client"
+    );
+    assert!(gate.was_dispatched(c2_t3).is_none());
+    assert_eq!(
+        gate.scheduler.service(gate_core::ClientId(1)),
+        Some(136_000.0)
+    );
+}
+
+#[test]
+fn cost_benefit_eviction_protects_large_warm_prefix_over_stale_one() {
+    let mut scheduler = Scheduler::new(
+        SchedulerConfig {
+            classes: vec![class("standard", 0)],
+            backfill: None,
+            eviction: EvictionPolicy::default(),
+            max_preemptions: 3,
+            unavailable_after: None,
+        },
+        Box::new(Vtc::default()),
+        Box::new(CostBenefit),
+    );
+    let mut now = 0;
+    let out = scheduler.handle(Event::BackendUp {
+        backend: BackendId(0),
+        shape: Shape {
+            model: ModelId(0),
+            layout: Layout::Unified { capacity: 100_000 },
+            slots: 2,
+            swap: false,
+        },
+        restarted: true,
+        snapshots: None,
+        now,
+    });
+    assert!(out.is_empty());
+
+    let demand = |client: u32, prompt: u64, generation: u64, pfx: Prefix| Demand {
+        client: gate_core::ClientId(client),
+        class: ClassId(0),
+        model: ModelId(0),
+        prompt,
+        work: prompt,
+        generation,
+        min_generation: 1,
+        prefix: pfx,
+        exclusive: false,
+        pinned: true,
+    };
+
+    // Place 40k context in slot 0 and 20k context in slot 1 at t = 0.
+    let _ = scheduler.handle(Event::Arrived {
+        ticket: TicketId(1),
+        demand: demand(1, 40_000, 100, prefix(1, 40_000)),
+        now,
+    });
+    let _ = scheduler.handle(Event::Finished {
+        ticket: TicketId(1),
+        resident: Some(40_000),
+        generated: Some(0),
+        cached: None,
+        now,
+    });
+    let _ = scheduler.handle(Event::Arrived {
+        ticket: TicketId(2),
+        demand: demand(2, 20_000, 100, prefix(2, 20_000)),
+        now,
+    });
+    let _ = scheduler.handle(Event::Finished {
+        ticket: TicketId(2),
+        resident: Some(20_000),
+        generated: Some(0),
+        cached: None,
+        now,
+    });
+
+    // Advance 10 minutes and refresh slot 1 so slot 0 is stale (40k / 11 ≈ 3.6k)
+    // while slot 1 is warm (20k / 1 = 20k).
+    now += 600_000;
+    let _ = scheduler.handle(Event::Arrived {
+        ticket: TicketId(3),
+        demand: demand(2, 20_000, 100, prefix(2, 20_000)),
+        now,
+    });
+    let _ = scheduler.handle(Event::Finished {
+        ticket: TicketId(3),
+        resident: Some(20_000),
+        generated: Some(0),
+        cached: None,
+        now,
+    });
+
+    // Request needing 70k fits only by clearing/evicting one slot: stale slot 0
+    // (40k) must be evicted while warm slot 1 (20k) stays!
+    let cmds = scheduler.handle(Event::Arrived {
+        ticket: TicketId(4),
+        demand: demand(3, 70_000, 100, prefix(3, 70_000)),
+        now,
+    });
+    assert!(
+        cmds.iter().any(|cmd| matches!(
+            cmd,
+            Command::Evict { slot: s, .. } if *s == slot(0, 0)
+        )),
+        "stale slot 0 should be evicted before warm slot 1: {cmds:?}"
+    );
+}
+
+#[test]
+fn time_aware_easy_backfill_blocks_slow_candidates_near_window_expiry() {
+    let mut setup = Setup::unified(100_000, 2).swap(false);
+    setup.backfill = Some(Backfill {
+        max_tokens: 20_000,
+        window: 5_000,
+    });
+    let mut gate = setup.build();
+
+    // Calibrate prefill_tps = 2,000 tok/s, decode_tps = 100 tok/s,
+    // expected_generation = 200 tokens.
+    let cal = gate.arrive(1, 4_000, 1_000, prefix(1, 4_000));
+    gate.advance(2_000);
+    gate.start(cal);
+    gate.advance(2_000);
+    gate.finish(cal, 200);
+
+    // Running request occupies 61,000 tokens; head arrives while running is
+    // still prefilling, then running starts decode 200ms before head's window
+    // expires so at waited=4,800ms: remaining_window=200ms, shadow_ms=500ms
+    // (200 expected tokens @ 100 tok/s = 2,000ms decode, 1,500ms elapsed).
+    let running = gate.arrive(2, 60_000, 1_000, prefix(2, 60_000));
+    gate.advance(25_200);
+    let head = gate.arrive(3, 50_000, 1_000, prefix(3, 50_000));
+    assert!(gate.was_dispatched(head).is_none());
+    gate.advance(3_300);
+    gate.start(running);
+    gate.advance(1_500); // waited = 4,800ms (remaining_window = 200ms), shadow_ms = 500ms
+
+    // Slow backfill (10,000 tokens, est runtime >> 500ms) must NOT stall head.
+    let slow = gate.arrive(4, 10_000, 500, prefix(4, 10_000));
+    assert!(
+        gate.was_dispatched(slow).is_none(),
+        "slow backfill near window expiry must wait behind head"
+    );
+
+    // Medium backfill (~250ms prefill*2 + 100ms decode? No, 100 prompt + 10 gen:
+    // est = 100*1000/2000 * 2 + 10*1000/100 = 100 + 100 = 200ms <= 500ms)
+    // and specifically a 150-token, 20-gen backfill (~150 + 200 = 350ms):
+    // 200ms < 350ms <= 500ms proves shadow_ms.max(remaining_window) is used!
+    let within_shadow = gate.arrive(5, 150, 20, prefix(5, 150));
+    assert!(
+        gate.was_dispatched(within_shadow).is_some(),
+        "backfill within shadow_ms (350ms <= 500ms) should run"
+    );
+
+    // Hard KV-pool safety invariant: even though expected_generation learned 200,
+    // a subsequent request with generation=8,000 still reserves full 8,000!
+    gate.finish(within_shadow, 20);
+    gate.finish(running, 200);
+    assert!(gate.was_dispatched(head).is_some());
+    gate.finish(head, 100);
+    gate.finish(slow, 100);
+
+    let full_reserve = gate.arrive(6, 50_000, 8_000, prefix(6, 50_000));
+    let dispatch = gate.was_dispatched(full_reserve).unwrap();
+    assert_eq!(dispatch.generation, 8_000);
+    let slot_usage = gate.scheduler.status(gate.now).backends[0]
+        .slots
+        .iter()
+        .find(|s| s.ticket == Some(full_reserve))
+        .unwrap()
+        .tokens;
+    assert_eq!(slot_usage, 58_000);
 }

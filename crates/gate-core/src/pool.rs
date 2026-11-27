@@ -96,6 +96,10 @@ pub(crate) struct Claim {
     pub preparation: Preparation,
     /// The operation in flight for this preparation.
     pub op: OpId,
+    /// When the current preparation operation was issued.
+    pub op_started_at: Millis,
+    /// Whether the current operation's timing is valid for backend telemetry.
+    pub op_telemetry: bool,
     /// The client left; finish the preparation, then keep the slot idle.
     pub abandoned: bool,
     pub reuse: Reuse,
@@ -107,10 +111,14 @@ pub(crate) struct Running {
     pub waiting: Waiting,
     pub reserved: Tokens,
     pub since: Millis,
+    /// When the first output token arrived (`Event::Started`).
+    pub started_at: Option<Millis>,
     pub reuse: Reuse,
     /// Its output has begun reaching the client, so it can no longer be
     /// paused.
     pub started: bool,
+    /// Whether timestamps for this run remain valid for backend telemetry.
+    pub telemetry: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -122,6 +130,8 @@ pub(crate) enum SlotState {
         resident: Resident,
         save: Option<SnapshotId>,
         op: OpId,
+        op_started_at: Millis,
+        op_telemetry: bool,
     },
     /// Claimed by a request and being prepared for it.
     Preparing(Box<Claim>),

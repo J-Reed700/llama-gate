@@ -12,19 +12,22 @@ mod status;
 
 pub use status::{BackendStatus, SlotStatus, Status, WaitingStatus};
 
-use crate::backend::{Backend, Shape};
+use crate::backend::{Backend, Shape, ewma_u64};
 use crate::evict::EvictionOrder;
 use crate::pool::{Pool, Preparation, Resident, Reuse, SlotState, Waiting};
 use crate::queue::QueueOrder;
 use crate::{
-    BackendId, Class, ClientId, Demand, Millis, OpId, Prefix, Rejection, SlotId, SnapshotId,
-    SnapshotIndex, TicketId, Tokens,
+    BackendId, Class, ClassId, ClientId, Demand, Millis, OpId, Prefix, Rejection, SlotId,
+    SnapshotId, SnapshotIndex, TicketId, Tokens,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
 /// A server's partial reuse is given up after this many misses without a
 /// single hit.
 const PARTIAL_TRIALS: u32 = 3;
+
+/// Prior expected generation length per class before any request finishes.
+const DEFAULT_EXPECTED_GENERATION: Tokens = 256;
 
 #[derive(Clone, Debug)]
 pub struct SchedulerConfig {
@@ -324,6 +327,9 @@ pub struct Scheduler {
     /// Requests started during the current scheduling pass, which are never
     /// paused in the same pass.
     fresh: BTreeSet<TicketId>,
+    /// Per-class EWMA of observed generation length (strictly for runtime
+    /// estimation, never for KV cell reservations).
+    class_expected_generation: Vec<(Tokens, bool)>,
 }
 
 impl std::fmt::Debug for Scheduler {
@@ -346,6 +352,8 @@ impl Scheduler {
         victims: Box<dyn EvictionOrder>,
     ) -> Self {
         assert!(!config.classes.is_empty(), "at least one class is required");
+        let class_expected_generation =
+            vec![(DEFAULT_EXPECTED_GENERATION, false); config.classes.len()];
         Self {
             config,
             backends: Vec::new(),
@@ -356,6 +364,7 @@ impl Scheduler {
             ops: 0,
             closing: false,
             fresh: BTreeSet::new(),
+            class_expected_generation,
         }
     }
 
@@ -368,14 +377,14 @@ impl Scheduler {
             Event::Withdrawn {
                 ticket, relayed, ..
             } => self.withdraw(ticket, relayed, now, &mut out),
-            Event::Started { ticket, .. } => self.started(ticket),
+            Event::Started { ticket, .. } => self.started(ticket, now),
             Event::Finished {
                 ticket,
                 resident,
                 generated,
                 cached,
                 ..
-            } => self.finish(ticket, resident, generated, cached, now, &mut out),
+            } => self.finish(ticket, resident, generated, cached, now, true, &mut out),
             Event::Bounced { ticket, .. } => self.bounced(ticket, now),
             Event::Evicted {
                 slot, op, outcome, ..
@@ -397,11 +406,7 @@ impl Scheduler {
                 snapshots,
                 ..
             } => self.backend_up(backend, shape, restarted, snapshots, now, &mut out),
-            Event::BackendDown { backend, .. } => {
-                if let Some(backend) = self.backend_mut(backend) {
-                    backend.online = false;
-                }
-            }
+            Event::BackendDown { backend, .. } => self.backend_down(backend),
             Event::Tick { .. } => self.tick(now, &mut out),
             Event::Shutdown { .. } => self.shutdown(&mut out),
         }
@@ -434,6 +439,17 @@ impl Scheduler {
                 }
             }
         }
+        let mut next_gen = vec![(DEFAULT_EXPECTED_GENERATION, false); config.classes.len()];
+        for (old_idx, &(tokens, observed)) in self.class_expected_generation.iter().enumerate() {
+            if !observed {
+                continue;
+            }
+            let new_idx = usize::from(class_of(ClassId(old_idx as u16)).0);
+            if let Some(slot) = next_gen.get_mut(new_idx) {
+                *slot = (tokens, true);
+            }
+        }
+        self.class_expected_generation = next_gen;
         self.config = config;
     }
 
@@ -550,20 +566,39 @@ impl Scheduler {
             Some(SlotState::Preparing(claim)) => claim.abandoned = true,
             Some(SlotState::Running(running)) => {
                 let charged = relayed.unwrap_or(running.waiting.demand.generation);
-                self.finish(ticket, None, Some(charged), None, now, out);
+                self.finish(ticket, None, Some(charged), None, now, false, out);
             }
             _ => {}
         }
     }
 
-    fn started(&mut self, ticket: TicketId) {
-        if let Some(slot) = self.find_ticket(ticket)
-            && let Some(SlotState::Running(running)) = self.slot_mut(slot)
-        {
+    fn started(&mut self, ticket: TicketId, now: Millis) {
+        let Some(slot) = self.find_ticket(ticket) else {
+            return;
+        };
+        let (uncached, elapsed, record) = {
+            let Some(SlotState::Running(running)) = self.slot_mut(slot) else {
+                return;
+            };
             running.started = true;
+            if running.started_at.is_some() {
+                return;
+            }
+            running.started_at = Some(now);
+            let uncached = running
+                .waiting
+                .demand
+                .prompt
+                .saturating_sub(running.reuse.tokens);
+            let elapsed = now.saturating_sub(running.since);
+            (uncached, elapsed, running.telemetry)
+        };
+        if record && let Some(backend) = self.backend_mut(slot.backend) {
+            backend.observe_prefill(uncached, elapsed);
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn finish(
         &mut self,
         ticket: TicketId,
@@ -571,6 +606,7 @@ impl Scheduler {
         generated: Option<Tokens>,
         cached: Option<Tokens>,
         now: Millis,
+        record_telemetry: bool,
         out: &mut Vec<Command>,
     ) {
         let Some(slot) = self.find_ticket(ticket) else {
@@ -582,6 +618,9 @@ impl Scheduler {
             {
                 let waiting = self.take_waiting(index);
                 self.charge_generation(&waiting.demand, generated);
+                if record_telemetry && let Some(generated_tokens) = generated {
+                    self.observe_generation(waiting.demand.class, generated_tokens);
+                }
             }
             return;
         };
@@ -623,6 +662,15 @@ impl Scheduler {
         }
         if let Some(resident) = resident {
             self.settle(slot.backend, ticket, running.reserved, resident, out);
+        }
+        if record_telemetry && let Some(generated_tokens) = generated {
+            self.observe_generation(running.waiting.demand.class, generated_tokens);
+            if running.telemetry
+                && let Some(started_at) = running.started_at
+                && let Some(backend) = self.backend_mut(slot.backend)
+            {
+                backend.observe_decode(generated_tokens, now.saturating_sub(started_at));
+            }
         }
         self.charge_generation(&running.waiting.demand, generated);
         self.learn(slot.backend, running.reuse, cached, out);
@@ -718,6 +766,8 @@ impl Scheduler {
                 },
                 save: None,
                 op,
+                op_started_at: now,
+                op_telemetry: true,
             };
             out.push(Command::Evict {
                 slot: SlotId { backend, index },
@@ -785,7 +835,13 @@ impl Scheduler {
             return;
         };
         match std::mem::replace(state, SlotState::Empty) {
-            SlotState::Evicting { resident, save, .. } => match outcome {
+            SlotState::Evicting {
+                resident,
+                save,
+                op_started_at,
+                op_telemetry,
+                ..
+            } => match outcome {
                 EvictOutcome::Failed => {
                     *state = SlotState::Faulted {
                         holding: resident.tokens,
@@ -793,6 +849,12 @@ impl Scheduler {
                     };
                 }
                 EvictOutcome::Saved { bytes, tokens } => {
+                    if op_telemetry
+                        && save.is_some()
+                        && let Some(backend) = self.backend_mut(slot.backend)
+                    {
+                        backend.observe_save(now.saturating_sub(op_started_at));
+                    }
                     if let Some(id) = save {
                         let tokens = known_or(tokens, resident.tokens);
                         self.remember(slot.backend, id, resident.prefix, tokens, bytes, out);
@@ -822,6 +884,11 @@ impl Scheduler {
                     }
                     EvictOutcome::Saved { .. } | EvictOutcome::Erased => {
                         if let (EvictOutcome::Saved { bytes, tokens }, Some(id)) = (outcome, save) {
+                            if claim.op_telemetry
+                                && let Some(backend) = self.backend_mut(slot.backend)
+                            {
+                                backend.observe_save(now.saturating_sub(claim.op_started_at));
+                            }
                             let tokens = known_or(tokens, previous.tokens);
                             self.remember(slot.backend, id, previous.prefix, tokens, bytes, out);
                         }
@@ -838,6 +905,8 @@ impl Scheduler {
                                 let op = self.next_op();
                                 claim.preparation = Preparation::Restoring { snapshot };
                                 claim.op = op;
+                                claim.op_started_at = now;
+                                claim.op_telemetry = true;
                                 self.set(slot, SlotState::Preparing(claim));
                                 out.push(Command::Restore { slot, snapshot, op });
                             }
@@ -887,6 +956,11 @@ impl Scheduler {
             return;
         };
         if let SaveOutcome::Saved { bytes, tokens } = outcome {
+            if claim.op_telemetry
+                && let Some(backend) = self.backend_mut(slot.backend)
+            {
+                backend.observe_save(now.saturating_sub(claim.op_started_at));
+            }
             let tokens = known_or(tokens, previous.tokens);
             self.remember(
                 slot.backend,
@@ -939,6 +1013,9 @@ impl Scheduler {
             RestoreOutcome::Restored { tokens } => {
                 let (prefix, tokens) = match self.backend_mut(slot.backend) {
                     Some(backend) => {
+                        if claim.op_telemetry {
+                            backend.observe_restore(now.saturating_sub(claim.op_started_at));
+                        }
                         backend.snapshots.touch(snapshot);
                         backend.snapshots.get(snapshot).map_or_else(
                             || (Prefix::opaque(tokens), tokens),
@@ -994,6 +1071,8 @@ impl Scheduler {
                         },
                         save: None,
                         op,
+                        op_started_at: now,
+                        op_telemetry: true,
                     },
                 );
                 out.push(Command::Evict {
@@ -1035,6 +1114,9 @@ impl Scheduler {
                     self.take_waiting(index);
                     let mut running = running;
                     running.started = true;
+                    if running.started_at.is_none() {
+                        running.telemetry = false;
+                    }
                     self.set(slot, SlotState::Running(running));
                 }
                 None => {
@@ -1155,12 +1237,14 @@ impl Scheduler {
                 backend.partial = true;
                 backend.partial_hits = 0;
                 backend.partial_misses = 0;
+                backend.reset_telemetry();
             }
             for (slot, state) in previous.slots.into_iter().enumerate() {
                 match state {
                     // Its finish (or failure) will still be reported, and if
                     // it had not been sent yet it runs on the new server.
-                    SlotState::Running(running) if slot < backend.pool.slots.len() => {
+                    SlotState::Running(mut running) if slot < backend.pool.slots.len() => {
+                        running.telemetry = false;
                         backend.pool.slots[slot] = SlotState::Running(running);
                     }
                     SlotState::Preparing(claim) if !claim.abandoned => requeue.push(claim.waiting),
@@ -1259,6 +1343,8 @@ impl Scheduler {
                     },
                     save: None,
                     op,
+                    op_started_at: now,
+                    op_telemetry: true,
                 },
             );
             out.push(Command::Evict {
@@ -1366,11 +1452,47 @@ impl Scheduler {
         waiting
     }
 
+    fn backend_down(&mut self, id: BackendId) {
+        let Some(backend) = self.backend_mut(id) else {
+            return;
+        };
+        backend.online = false;
+        for state in &mut backend.pool.slots {
+            match state {
+                SlotState::Running(running) => running.telemetry = false,
+                SlotState::Preparing(claim) => claim.op_telemetry = false,
+                SlotState::Evicting { op_telemetry, .. } => *op_telemetry = false,
+                _ => {}
+            }
+        }
+    }
+
     fn charge_generation(&mut self, demand: &Demand, generated: Option<Tokens>) {
         if let Some(class) = self.config.classes.get(usize::from(demand.class.0)) {
             self.order
                 .served_generation(demand.client, class, generated.unwrap_or(0));
         }
+    }
+
+    fn observe_generation(&mut self, class: ClassId, generated: Tokens) {
+        let Some((current, observed)) =
+            self.class_expected_generation.get_mut(usize::from(class.0))
+        else {
+            return;
+        };
+        if *observed {
+            *current = ewma_u64(*current, generated);
+        } else {
+            *current = generated;
+            *observed = true;
+        }
+    }
+
+    pub(super) fn expected_generation(&self, class: ClassId, limit: Tokens) -> Tokens {
+        self.class_expected_generation
+            .get(usize::from(class.0))
+            .map_or(DEFAULT_EXPECTED_GENERATION, |(tokens, _)| *tokens)
+            .min(limit)
     }
 
     /// Learns from what the server actually reused whether partial reuse

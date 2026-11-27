@@ -35,6 +35,12 @@ pub trait QueueOrder: Send + std::fmt::Debug {
     /// A request of `client` started running with `tokens` of prompt.
     fn served_prompt(&mut self, _client: ClientId, _class: &Class, _tokens: Tokens) {}
 
+    /// A request of `client` started running with `tokens` of cached prompt
+    /// reused from a slot or snapshot.
+    fn served_cached_prompt(&mut self, client: ClientId, class: &Class, tokens: Tokens) {
+        self.served_prompt(client, class, tokens);
+    }
+
     /// A request of `client` finished after generating `tokens`.
     fn served_generation(&mut self, _client: ClientId, _class: &Class, _tokens: Tokens) {}
 
@@ -69,6 +75,7 @@ impl QueueOrder for Fifo {
 #[derive(Clone, Debug)]
 pub struct Vtc {
     input: f64,
+    cached_input: f64,
     output: f64,
     counters: HashMap<ClientId, f64>,
     last_departed: Option<f64>,
@@ -77,9 +84,16 @@ pub struct Vtc {
 impl Vtc {
     /// The paper's defaults weigh a generated token twice a prompt token,
     /// reflecting that decode costs more GPU time per token than prefill.
+    /// Cached prompt tokens default to 10% of `input`.
     pub fn new(input: f64, output: f64) -> Self {
+        Self::with_cached(input, input * 0.1, output)
+    }
+
+    /// Like [`Vtc::new`], with an explicit weight for cached prompt tokens.
+    pub fn with_cached(input: f64, cached_input: f64, output: f64) -> Self {
         Self {
             input,
+            cached_input,
             output,
             counters: HashMap::new(),
             last_departed: None,
@@ -137,6 +151,10 @@ impl QueueOrder for Vtc {
 
     fn served_prompt(&mut self, client: ClientId, class: &Class, tokens: Tokens) {
         self.charge(client, class, self.input * tokens as f64);
+    }
+
+    fn served_cached_prompt(&mut self, client: ClientId, class: &Class, tokens: Tokens) {
+        self.charge(client, class, self.cached_input * tokens as f64);
     }
 
     fn served_generation(&mut self, client: ClientId, class: &Class, tokens: Tokens) {
@@ -202,5 +220,35 @@ mod tests {
         let mut vtc = Vtc::default();
         vtc.served_prompt(ClientId(1), &heavy, 4_000);
         assert_eq!(vtc.counter(ClientId(1)), 1_000.0);
+    }
+
+    #[test]
+    fn cached_prompt_charges_discounted_weight_and_custom_policies_delegate() {
+        let class = Class::new("standard");
+        let mut vtc = Vtc::new(1.0, 2.0);
+        vtc.served_prompt(ClientId(1), &class, 1_000);
+        vtc.served_cached_prompt(ClientId(1), &class, 99_000);
+        assert!((vtc.counter(ClientId(1)) - 10_900.0).abs() < 1e-6);
+
+        let mut custom = Vtc::with_cached(1.0, 0.25, 2.0);
+        custom.served_cached_prompt(ClientId(2), &class, 4_000);
+        assert!((custom.counter(ClientId(2)) - 1_000.0).abs() < 1e-6);
+
+        #[derive(Debug, Default)]
+        struct LegacyOrder {
+            charged: Tokens,
+        }
+        impl QueueOrder for LegacyOrder {
+            fn key(&self, _candidate: Candidate<'_>) -> f64 {
+                0.0
+            }
+            fn served_prompt(&mut self, _client: ClientId, _class: &Class, tokens: Tokens) {
+                self.charged += tokens;
+            }
+        }
+        let mut legacy = LegacyOrder::default();
+        legacy.served_prompt(ClientId(1), &class, 500);
+        legacy.served_cached_prompt(ClientId(1), &class, 1_500);
+        assert_eq!(legacy.charged, 2_000);
     }
 }
