@@ -918,6 +918,7 @@ async fn bodies_held_past_the_budget_are_refused_until_some_finish() {
 async fn authorized_post_with_api_key_reads_body_schedules_and_forwards_it() {
     let fake = Fake::start(4_000, 1, None, Duration::from_millis(1)).await;
     let mut config = quick(&fake.url);
+    config.server.max_body = gate_server::units::Size(1_024);
     config.auth.required = true;
     config.auth.keys = vec![KeyConfig {
         key: Secret::new("sk-app"),
@@ -926,6 +927,28 @@ async fn authorized_post_with_api_key_reads_body_schedules_and_forwards_it() {
     }];
     config.auth.admin_keys = vec![Secret::new("sk-admin")];
     let gate = start(config, None, Some("sk-admin")).await;
+
+    // Oversized body (> max_body) proves precheck (401) and is_slot_action (403)
+    // reject BEFORE to_bytes reads the body (otherwise they would return 413).
+    let oversized = json!({"model": "fake", "padding": "x".repeat(2_048)});
+    let (status, _) = send(&gate.url, "/v1/chat/completions", oversized.clone(), &[]).await;
+    assert_eq!(status, 401);
+    let (status, _) = send(
+        &gate.url,
+        "/slots/0?action=erase",
+        oversized.clone(),
+        &[("authorization", "Bearer sk-app")],
+    )
+    .await;
+    assert_eq!(status, 403);
+    let (status, _) = send(
+        &gate.url,
+        "/v1/chat/completions",
+        oversized,
+        &[("authorization", "Bearer sk-app")],
+    )
+    .await;
+    assert_eq!(status, 413);
 
     // Wrong key is rejected before body read.
     let (status, _) = send(

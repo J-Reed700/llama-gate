@@ -49,7 +49,7 @@ impl Engine {
                 String::new(),
                 cached,
             );
-            if report.prompt > 0 {
+            if report.outcome == "ok" && report.prompt > 0 {
                 metrics.count("llama_gate_prefix_cache_queries_total", String::new(), 1);
                 if cached > 0 {
                     metrics.count("llama_gate_prefix_cache_hits_total", String::new(), 1);
@@ -188,11 +188,11 @@ mod tests {
         one_tok.total_ms = 25;
         engine.record(one_tok);
 
-        // 3. Zero-token error request: no TPOT sample, cached=None -> no prefix cache query.
+        // 3. Zero-token error request: no TPOT sample, cached=Some(10) ignored on non-ok outcome.
         let mut err = base_report();
         err.outcome = "error";
         err.generated = Some(0);
-        err.cached = None;
+        err.cached = Some(10);
         err.ttft_ms = None;
         engine.record(err);
 
