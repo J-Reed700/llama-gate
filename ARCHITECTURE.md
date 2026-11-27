@@ -88,8 +88,10 @@ never exceed usage, so no server's pool can overflow.
 ### Placing a request
 
 1. **Order.** Waiting requests are sorted by class priority, then requests
-   that were paused (admitted once already), then the `QueueOrder` key (VTC
-   counter by default), then arrival. Each model's first request is its
+   that were paused (admitted once already), then the `QueueOrder` key
+   (cache-discounted VTC counter by default, weighting cached prompt tokens at
+   `cached_input_weight` — `0.1 * input_weight` by default — and uncached
+   tokens at `input_weight`), then arrival. Each model's first request is its
    *head*.
 2. **Plan** the head over every available slot (Empty or Idle) on every
    online backend of its model:
@@ -99,19 +101,27 @@ never exceed usage, so no server's pool can overflow.
      place too, after *saving* the context if the unshared part is worth
      keeping;
    - otherwise its context is *cleared* (saved first if worth keeping);
-   - a snapshot covering the request's start may be *restored*;
-   - the best option fits now, reuses an appreciably larger part of the
-     prompt, runs on a less busy backend, reuses more, destroys the least,
-     and runs on a less full backend, in that order.
+   - a snapshot covering the request's start may be *restored*, and when a
+     slot offers both an in-place reuse and a snapshot restore, both are ranked
+     so hot VRAM is never overwritten by a slower disk restore;
+   - the best option (`Choice`) fits now, falls in the lowest 128 ms
+     estimated-TTFT bucket (using each backend's observed EWMA prefill,
+     restore, and save rates), prefers hot VRAM over a disk restore, runs on
+     a less busy backend, reuses more, destroys no context, destroys the
+     policy's first victim, and runs on a less full backend, in that order.
 3. If no option fits:
    - idle contexts on that backend that would make room are **evicted**
-     (`EvictionOrder` picks which), and the head waits for them;
+     (`EvictionOrder::rank_at` picks which — `LeastRecentlyUsed`, `Smallest`,
+     `Largest`, or `CostBenefit`, which protects large warm prefixes while
+     aging out stale ones), and the head waits for them;
    - else, lower-priority requests of a *preemptible* class that have shown
      no output are **paused** (fewest first, least work lost), with idle
      contexts evicted as needed;
    - else the head **waits** for running work; meanwhile small requests of
      its model may **backfill** what is free, until the head has waited for
-     the backfill window.
+     the backfill window (and when running slots have observed speed
+     estimates, only if the backfill's estimated runtime fits within the
+     head's shadow time or remaining window).
 4. A request that could never fit any backend of its model is refused at
    once; one whose model has had no server online for `upstream_wait` is
    refused when that passes.
@@ -223,27 +233,38 @@ classes by name.
 ## The data plane
 
 ```text
-request ─▶ authenticate ─▶ dialect? ─no─▶ pass through (to a server of the named model)
-                              │yes
-                              ▼
-                 identify ─▶ measure ─▶ Arrive ─▶ session
-                                                     │
-    ┌──────────────────── grant ◀───────────────────┘
+request ─▶ precheck (401/403) ─▶ read body ─▶ identify ─▶ dialect? ─no─▶ pass through
+                                                            │yes
+                                                            ▼
+                                              measure ─▶ Arrive ─▶ session
+                                                                      │
+    ┌───────────────────────────── grant ◀───────────────────────────┘
     ▼
-  attempt: pin id_slot, set the limit ─▶ forward ─┬─ response ─▶ relay ─▶ Finish
-                                                  ├─ paused ───▶ wait for the next grant
-                                                  └─ refused ──▶ Bounce ─▶ next grant
+  attempt: pin id_slot, limit, include_usage ─▶ forward ─┬─ response ─▶ relay (strip synthetic usage) ─▶ Finish
+                                                         ├─ paused ───▶ wait for the next grant
+                                                         └─ refused ──▶ Bounce ─▶ next grant
 ```
 
-A generative request is a **session** that may span several attempts. The
-client sees one response: a streaming response is answered through a
+A generative request is a **session** that may span several attempts. Before
+buffering a byte of request body, the proxy checks slot-action restrictions
+(`403`) and `Identify::precheck` (`401`); once the bounded body is read and
+parsed, `Identify::identify` attributes the caller (`Caller { peer, headers,
+body }`). Every request is also assigned a sanitized `x-request-id` (kept if
+valid printable ASCII up to 128 bytes, otherwise generated) that propagates
+upstream and echoes on every response and error.
+
+The client sees one response: a streaming response is answered through a
 channel that outlives each attempt, mirroring the first server's headers (or
 committing to `200 text/event-stream` with keepalive comments once the
 request has waited `keepalive_after`); between attempts the client receives
 pings, and a refusal or error after commitment arrives in-band as an `error`
-event, as llama.cpp reports mid-stream errors. However the session ends,
-the engine hears exactly once: `Finish` with the usage read from the
-response's tail, or `Withdraw`.
+event, as llama.cpp reports mid-stream errors. For OpenAI streaming dialects
+where the client omitted `stream_options.include_usage`, the session injects it
+before forwarding and enables `Reader::strip_usage_only` so the server's final
+`usage`/`timings` are absorbed to reclaim unused generation reservations while
+the synthetic `choices: []` chunk is stripped from the client's stream. However
+the session ends, the engine hears exactly once: `Finish` with the usage read
+from the response's tail, or `Withdraw`.
 
 ## Extension points
 

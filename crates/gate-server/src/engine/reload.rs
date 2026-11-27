@@ -71,7 +71,24 @@ pub fn restart_notes(current: &Config, next: &Config) -> Vec<String> {
             current.server.drain.0 != next.server.drain.0,
         ),
         ("queue.tick", current.queue.tick.0 != next.queue.tick.0),
+        ("queue.order", current.queue.order != next.queue.order),
+        (
+            "queue.input_weight",
+            current.queue.input_weight != next.queue.input_weight,
+        ),
+        (
+            "queue.cached_input_weight",
+            current.queue.cached_input_weight != next.queue.cached_input_weight,
+        ),
+        (
+            "queue.output_weight",
+            current.queue.output_weight != next.queue.output_weight,
+        ),
         ("eviction.mode", current.eviction.mode != next.eviction.mode),
+        (
+            "eviction.victim",
+            current.eviction.victim != next.eviction.victim,
+        ),
         (
             "eviction.directory",
             current.eviction.directory != next.eviction.directory,

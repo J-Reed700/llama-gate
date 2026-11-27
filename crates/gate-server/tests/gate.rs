@@ -1234,3 +1234,54 @@ async fn request_id_propagates_and_sanitizes_and_golden_metrics_are_recorded() {
         "{metrics}"
     );
 }
+
+#[tokio::test]
+async fn streaming_usage_injection_reclaims_idle_reservation_transparently() {
+    let fake = Fake::start(4_000, 1, None, Duration::from_millis(1)).await;
+    let gate = gate(&fake, |config| {
+        config.admission.default_generation = 500;
+        config.queue.cached_input_weight = Some(0.25);
+        config.eviction.victim = gate_server::config::VictimKind::CostBenefit;
+    })
+    .await;
+    let client = reqwest::Client::new();
+
+    // (a) Without stream_options: gate injects include_usage, strips the synthetic
+    // usage-only chunk from the client, yet records exact generated tokens and
+    // reclaims the slot reservation from 20 + 500 down to 20 + 4 = 24.
+    let resp = client
+        .post(format!("{}/v1/chat/completions", gate.url))
+        .json(&chat_body("silent-", 20, 4, true))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body = resp.text().await.unwrap();
+    assert_eq!(body.matches("\"t \"").count(), 4, "{body}");
+    assert!(body.contains("data: [DONE]"), "{body}");
+    assert!(
+        !body.contains("\"usage\"") && !body.contains("\"choices\":[]"),
+        "synthetic usage chunk was stripped: {body}"
+    );
+
+    let status = status_of(&gate).await;
+    assert_eq!(status["recent"][0]["prompt"], 20, "{status}");
+    assert_eq!(status["recent"][0]["generated"], 4, "{status}");
+    assert_eq!(status["backends"][0]["usage"], 24, "{status}");
+    assert_eq!(status["backends"][0]["slots"][0]["tokens"], 24, "{status}");
+
+    // (b) With stream_options.include_usage = true: the client receives the usage chunk.
+    let mut explicit = chat_body("explicit-", 12, 3, true);
+    explicit["stream_options"] = json!({"include_usage": true});
+    let resp = client
+        .post(format!("{}/v1/chat/completions", gate.url))
+        .json(&explicit)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body = resp.text().await.unwrap();
+    assert_eq!(body.matches("\"t \"").count(), 3, "{body}");
+    assert!(body.contains("\"choices\":[]"), "{body}");
+    assert!(body.contains("\"completion_tokens\":3"), "{body}");
+}

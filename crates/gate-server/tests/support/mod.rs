@@ -454,6 +454,10 @@ async fn chat(
         .unwrap_or(u64::MAX);
     let generate = hint.min(limit);
     let streaming = body["stream"].as_bool().unwrap_or(false);
+    let include_usage = body
+        .pointer("/stream_options/include_usage")
+        .and_then(Value::as_bool)
+        == Some(true);
     let pinned = body["id_slot"]
         .as_i64()
         .filter(|slot| *slot >= 0)
@@ -545,10 +549,29 @@ async fn chat(
                 Some((Ok(Bytes::from(chunk)), (index + 1, Some(busy))))
             } else if index == generate {
                 state.completions.fetch_add(1, Ordering::SeqCst);
-                let chunk = format!(
-                    "data: {}\n\ndata: [DONE]\n\n",
-                    json!({"choices": [{"delta": {}, "finish_reason": "stop"}], "timings": {"cache_n": cache_n, "prompt_n": prompt.saturating_sub(cache_n), "predicted_n": generate}})
+                let mut chunk = format!(
+                    "data: {}\n\n",
+                    json!({"choices": [{"delta": {}, "finish_reason": "stop"}]})
                 );
+                if include_usage {
+                    chunk.push_str(&format!(
+                        "data: {}\n\n",
+                        json!({
+                            "choices": [],
+                            "usage": {
+                                "prompt_tokens": prompt,
+                                "completion_tokens": generate,
+                                "prompt_tokens_details": {"cached_tokens": cache_n}
+                            },
+                            "timings": {
+                                "cache_n": cache_n,
+                                "prompt_n": prompt.saturating_sub(cache_n),
+                                "predicted_n": generate
+                            }
+                        })
+                    ));
+                }
+                chunk.push_str("data: [DONE]\n\n");
                 busy.done = true;
                 drop(busy);
                 Some((Ok(Bytes::from(chunk)), (index + 1, None)))

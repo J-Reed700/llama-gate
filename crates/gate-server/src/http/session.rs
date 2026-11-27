@@ -137,6 +137,7 @@ pub(super) async fn generate(
         dialect,
         body,
         owns_key,
+        strip_usage: false,
         request_id: request_id.clone(),
         arrived,
         waiting_since: Instant::now(),
@@ -202,6 +203,7 @@ pub(super) struct Session {
     requested: Option<Tokens>,
     generates: bool,
     owns_key: bool,
+    strip_usage: bool,
     request_id: String,
     arrived: Instant,
     /// When the current wait for a grant began.
@@ -315,6 +317,7 @@ impl Session {
         if let (Some(model), Some(object)) = (&link.router_model, body.as_object_mut()) {
             object.insert("model".into(), Value::String(model.clone()));
         }
+        self.strip_usage = self.dialect.ensure_stream_usage(&mut body);
         let bytes = Bytes::from(serde_json::to_vec(&body).unwrap_or_default());
         let request = upstream_request(
             &self.state,
@@ -471,7 +474,8 @@ impl Session {
                 // Events are relayed whole, and output is told by meaning:
                 // progress and opening events before the first token leave
                 // the request pausable.
-                let mut reader = Reader::new(self.dialect.wire());
+                let mut reader =
+                    Reader::new(self.dialect.wire()).strip_usage_only(self.strip_usage);
                 'attempt: loop {
                     let step = if self.control.started() {
                         Some(stream.next().await)

@@ -113,8 +113,9 @@ verify_every = 32
 # vtc:  Virtual Token Counter fair queueing between clients (OSDI '24).
 # fifo: first come, first served.
 order = "vtc"
-# VTC cost of a prompt token and of a generated token.
+# VTC cost of a prompt token, cached prompt token, and generated token.
 input_weight = 1.0
+# cached_input_weight = 0.1      # default: 0.1 * input_weight
 output_weight = 2.0
 # A streaming request queued longer than keepalive_after receives SSE
 # comment pings (": queued") every keepalive_interval, so clients and
@@ -142,7 +143,7 @@ window = "60s"
 #          --slot-save-path DIR and `directory` below pointing at DIR.
 # discard: clear idle contexts; a returning conversation is recomputed.
 mode = "swap"
-# Which idle context gives way first: least_recently_used, smallest, largest.
+# Which idle context gives way first: least_recently_used, smallest, largest, cost_benefit.
 victim = "least_recently_used"
 # The server's --slot-save-path as this process sees it (mount the same
 # directory into both), when no [[backends]] are listed. Unset or
