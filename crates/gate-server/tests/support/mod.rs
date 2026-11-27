@@ -399,18 +399,23 @@ async fn chat(
     {
         state.request_ids.lock().unwrap().push(id.to_owned());
     }
-    if state
-        .loading
-        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
-            left.checked_sub(1)
-        })
-        .is_ok()
-    {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({"error": {"code": 503, "message": "Loading model", "type": "unavailable_error"}})),
-        )
-            .into_response();
+    let mut left = state.loading.load(Ordering::SeqCst);
+    while left > 0 {
+        match state.loading.compare_exchange_weak(
+            left,
+            left - 1,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        ) {
+            Ok(_) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({"error": {"code": 503, "message": "Loading model", "type": "unavailable_error"}})),
+                )
+                    .into_response();
+            }
+            Err(actual) => left = actual,
+        }
     }
     let prompt = words(&render(&body));
     let hint = body["messages"]
