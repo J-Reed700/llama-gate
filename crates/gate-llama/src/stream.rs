@@ -151,38 +151,46 @@ fn field(event: &mut Event, line: &[u8]) {
     }
 }
 
+fn parse_event_json(event: &Event) -> Option<Value> {
+    let data = event.data.as_deref()?;
+    if data.trim() == "[DONE]" {
+        return None;
+    }
+    serde_json::from_str(data).ok()
+}
+
 /// What `event` means for an API shaped like `wire`.
 pub fn classify(wire: Wire, event: &Event) -> Kind {
+    let value = parse_event_json(event);
+    classify_value(wire, event, value.as_ref())
+}
+
+fn classify_value(wire: Wire, event: &Event, value: Option<&Value>) -> Kind {
     let Some(data) = event.data.as_deref() else {
         return Kind::Other;
     };
     if data.trim() == "[DONE]" {
         return Kind::Done;
     }
-    let value: Option<Value> = serde_json::from_str(data).ok();
     if event.name.as_deref() == Some("error") {
-        return Kind::Error(
-            value
-                .as_ref()
-                .map_or_else(|| data.to_owned(), error_message),
-        );
+        return Kind::Error(value.map_or_else(|| data.to_owned(), error_message));
     }
     let Some(value) = value else {
         // Not JSON: nothing to tell it by, so it is treated as output.
         return Kind::Output;
     };
     if value.get("error").is_some_and(|error| !error.is_null()) {
-        return Kind::Error(error_message(&value));
+        return Kind::Error(error_message(value));
     }
     let kind = match wire {
-        Wire::OpenAiChat => choices_kind(&value, |choice| {
+        Wire::OpenAiChat => choices_kind(value, |choice| {
             let delta = choice.get("delta").unwrap_or(&Value::Null);
             ["content", "reasoning_content", "reasoning", "refusal"]
                 .iter()
                 .any(|key| non_empty_text(delta.get(*key)))
                 || non_empty_array(delta.get("tool_calls"))
         }),
-        Wire::OpenAiCompletion => choices_kind(&value, |choice| non_empty_text(choice.get("text"))),
+        Wire::OpenAiCompletion => choices_kind(value, |choice| non_empty_text(choice.get("text"))),
         Wire::Llama => {
             if non_empty_text(value.get("content"))
                 || non_empty_array(value.get("tokens"))
@@ -195,7 +203,7 @@ pub fn classify(wire: Wire, event: &Event) -> Kind {
         }
         Wire::Responses => match value.get("type").and_then(Value::as_str) {
             Some("response.created" | "response.in_progress") => Kind::Preamble,
-            Some("response.failed" | "error") => Kind::Error(error_message(&value)),
+            Some("response.failed" | "error") => Kind::Error(error_message(value)),
             _ => Kind::Output,
         },
         Wire::Anthropic => match event
@@ -360,10 +368,9 @@ fn fill(slot: &mut Option<u64>, value: Option<u64>) {
 
 fn is_synthetic_usage_only(wire: Wire, value: &Value) -> bool {
     matches!(wire, Wire::OpenAiChat | Wire::OpenAiCompletion)
-        && value
-            .get("choices")
-            .and_then(Value::as_array)
-            .is_some_and(Vec::is_empty)
+        && value.get("choices").is_none_or(|choices| {
+            choices.is_null() || choices.as_array().is_some_and(Vec::is_empty)
+        })
         && value.get("usage").is_some_and(|usage| !usage.is_null())
         && value.get("error").is_none_or(Value::is_null)
         && value.get("prompt_progress").is_none()
@@ -404,11 +411,8 @@ impl Reader {
             .split(chunk)
             .into_iter()
             .filter_map(|(bytes, event)| {
-                let kind = classify(self.wire, &event);
-                let value = event
-                    .data
-                    .as_deref()
-                    .and_then(|data| serde_json::from_str::<Value>(data).ok());
+                let value = parse_event_json(&event);
+                let kind = classify_value(self.wire, &event, value.as_ref());
                 if let Some(value) = value.as_ref() {
                     absorb(self.wire, value, &mut self.usage);
                 }
@@ -798,6 +802,25 @@ mod tests {
             vec![Kind::Preamble, Kind::Error("boom".into()), Kind::Done]
         );
         assert_eq!(reader.failure(), Some("boom"));
+
+        // Omitted or null `choices` with usage present are also stripped cleanly.
+        for chunk in [
+            "data: {\"usage\":{\"prompt_tokens\":14,\"completion_tokens\":2}}\n\n",
+            "data: {\"choices\":null,\"usage\":{\"prompt_tokens\":15,\"completion_tokens\":3}}\n\n",
+        ] {
+            let sse = format!(
+                "data: {{\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"ok\"}}}}]}}\n\n{chunk}data: [DONE]\n\n"
+            );
+            let mut reader = Reader::new(Wire::OpenAiChat).strip_usage_only(true);
+            let kinds: Vec<Kind> = reader
+                .read(sse.as_bytes())
+                .into_iter()
+                .map(|piece| piece.kind)
+                .collect();
+            assert_eq!(kinds, vec![Kind::Output, Kind::Done]);
+            assert!(reader.usage().prompt.is_some());
+            assert!(reader.usage().generated.is_some());
+        }
     }
 
     #[test]

@@ -104,16 +104,7 @@ impl Sniffer {
                 let input = field("input_tokens");
                 let cache_read = field("cache_read_input_tokens");
                 let cache_creation = field("cache_creation_input_tokens");
-                if reported
-                    .get("input_tokens_details")
-                    .is_some_and(|details| !details.is_null())
-                    && cache_read.is_none()
-                    && cache_creation.is_none()
-                {
-                    // OpenAI Responses: `input_tokens` already includes cached tokens.
-                    input
-                } else if input.is_some() || cache_read.is_some() || cache_creation.is_some() {
-                    // Anthropic counts cache reads and creations apart from `input_tokens`.
+                if cache_read.is_some() || cache_creation.is_some() {
                     Some(
                         input
                             .unwrap_or(0)
@@ -121,7 +112,7 @@ impl Sniffer {
                             .saturating_add(cache_creation.unwrap_or(0)),
                     )
                 } else {
-                    None
+                    input
                 }
             });
             usage.generated = usage
