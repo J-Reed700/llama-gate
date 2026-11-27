@@ -19,10 +19,10 @@ use crate::models::{Models, reported_names};
 use crate::snapshots::{Loaded, Persister, SnapshotStore, StartOver};
 use bytes::Bytes;
 use gate_core::{
-    BackendId, Backfill, Class, ClassId, ClientId, Command, Demand, Event, EvictOutcome,
-    EvictionOrder, EvictionPolicy, Fifo, Largest, Layout, LeastRecentlyUsed, Millis, ModelId,
-    Notice, Observation, PreemptOutcome, QueueOrder, Rejection, RestoreOutcome, SaveOutcome,
-    Scheduler, SchedulerConfig, Shape, SlotId, SnapshotId, TicketId, Tokens, Vtc,
+    BackendId, Backfill, Class, ClassId, ClientId, Command, CostBenefit, Demand, Event,
+    EvictOutcome, EvictionOrder, EvictionPolicy, Fifo, Largest, Layout, LeastRecentlyUsed, Millis,
+    ModelId, Notice, Observation, PreemptOutcome, QueueOrder, Rejection, RestoreOutcome,
+    SaveOutcome, Scheduler, SchedulerConfig, Shape, SlotId, SnapshotId, TicketId, Tokens, Vtc,
 };
 use gate_llama::usage::Usage;
 use gate_llama::{
@@ -78,6 +78,7 @@ pub struct Arrival {
 #[derive(Clone, Debug, Serialize)]
 pub struct Report {
     pub ticket: TicketId,
+    pub request_id: String,
     /// Milliseconds since the gate started; set by the engine.
     pub at_ms: Millis,
     pub client: Arc<str>,
@@ -428,10 +429,17 @@ impl Engine {
         let order: Box<dyn QueueOrder> = match policies.queue_order {
             Some(order) => order,
             None => match config.queue.order {
-                QueueOrderKind::Vtc => Box::new(Vtc::new(
-                    config.queue.input_weight,
-                    config.queue.output_weight,
-                )),
+                QueueOrderKind::Vtc => match config.queue.cached_input_weight {
+                    Some(cached) => Box::new(Vtc::with_cached(
+                        config.queue.input_weight,
+                        cached,
+                        config.queue.output_weight,
+                    )),
+                    None => Box::new(Vtc::new(
+                        config.queue.input_weight,
+                        config.queue.output_weight,
+                    )),
+                },
                 QueueOrderKind::Fifo => Box::new(Fifo),
             },
         };
@@ -441,6 +449,7 @@ impl Engine {
                 VictimKind::LeastRecentlyUsed => Box::new(LeastRecentlyUsed),
                 VictimKind::Smallest => Box::new(gate_core::Smallest),
                 VictimKind::Largest => Box::new(Largest),
+                VictimKind::CostBenefit => Box::new(CostBenefit),
             },
         };
         let scheduler = Scheduler::new(scheduler_config(&config), order, victims);

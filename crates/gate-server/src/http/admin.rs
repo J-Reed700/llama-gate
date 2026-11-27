@@ -2,7 +2,8 @@
 //! events, reload, and the model list.
 
 use super::*;
-use crate::clients::{Caller, IdentifyResult};
+use crate::clients::Caller;
+use axum::extract::Path;
 
 /// The dashboard page, compiled into the binary.
 pub(super) const DASHBOARD: &str = include_str!("../../assets/dashboard.html");
@@ -177,6 +178,25 @@ pub async fn apply_reload(state: &AppState) -> Result<Vec<String>, String> {
     Ok(notes)
 }
 
+fn not_caller(state: &AppState, peer: SocketAddr, headers: &HeaderMap) -> Option<Response> {
+    let identify = state.identify();
+    let denied = identify
+        .precheck(peer.ip(), headers)
+        .and_then(|()| {
+            identify.identify(Caller {
+                peer: peer.ip(),
+                headers,
+                body: &Value::Null,
+            })
+        })
+        .err()?;
+    Some(error(
+        StatusCode::UNAUTHORIZED,
+        "authentication_error",
+        denied.message().into(),
+    ))
+}
+
 /// The models clients may ask for. With one backend, the server's own
 /// answer; with several, the gate's model names.
 pub(super) async fn models(
@@ -185,21 +205,9 @@ pub(super) async fn models(
     request: Request,
 ) -> Response {
     let (parts, _) = request.into_parts();
-    let _ = Caller {
-        peer: peer.ip(),
-        headers: &parts.headers,
-        body: &Value::Null,
-    };
-    match state.identify().identify_headers(&parts.headers, peer.ip()) {
-        Ok(IdentifyResult::Identified(_)) => (),
-        Ok(IdentifyResult::NeedsBody(_)) => (), // Should not happen
-        Err(denied) => {
-            return error(
-                StatusCode::UNAUTHORIZED,
-                "authentication_error",
-                denied.message().into(),
-            );
-        }
+    let request_id = request_id_for(&state, &parts.headers);
+    if let Some(denied) = not_caller(&state, peer, &parts.headers) {
+        return with_request_id(denied, &request_id);
     }
     if state.backends.len() == 1
         && let Some(link) = state.backend_for(None)
@@ -214,6 +222,7 @@ pub(super) async fn models(
             peer,
             Bytes::new(),
             owns_key,
+            &request_id,
         )
         .await;
     }
@@ -237,5 +246,36 @@ pub(super) async fn models(
             })
         })
         .collect();
-    axum::Json(json!({"object": "list", "data": data})).into_response()
+    with_request_id(
+        axum::Json(json!({"object": "list", "data": data})).into_response(),
+        &request_id,
+    )
+}
+
+/// Single-model lookup (`GET /v1/models/{model}`), matching OpenAI and vLLM.
+pub(super) async fn model_info(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Path(model): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let request_id = request_id_for(&state, &headers);
+    if let Some(denied) = not_caller(&state, peer, &headers) {
+        return with_request_id(denied, &request_id);
+    }
+    let response = match state.models.find(&model) {
+        Some(id) => axum::Json(json!({
+            "id": state.models.name(id),
+            "object": "model",
+            "created": 0,
+            "owned_by": "llama-gate",
+        }))
+        .into_response(),
+        None => error(
+            StatusCode::NOT_FOUND,
+            "invalid_request_error",
+            format!("the model '{model}' does not exist"),
+        ),
+    };
+    with_request_id(response, &request_id)
 }

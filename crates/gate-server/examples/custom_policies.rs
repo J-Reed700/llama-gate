@@ -13,7 +13,7 @@
 use gate_core::{Candidate, ClassId, ClientId, EvictionOrder, QueueOrder, Resident, SlotId};
 use gate_llama::{Dialect, Dialects, Prompt};
 use gate_server::Gate;
-use gate_server::clients::{Denied, Identify, IdentifyResult, Identity, IntermediateState};
+use gate_server::clients::{Caller, Denied, Identify, Identity};
 use gate_server::config::Config;
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -49,16 +49,26 @@ impl EvictionOrder for KeepLongContexts {
 #[derive(Debug)]
 struct ByTenant;
 
-impl Identify for ByTenant {
-    fn identify_headers(
-        &self,
-        headers: &axum::http::HeaderMap,
-        _peer: std::net::IpAddr,
-    ) -> Result<IdentifyResult, Denied> {
-        let tenant = headers
+impl ByTenant {
+    fn tenant(headers: &axum::http::HeaderMap) -> Result<&str, Denied> {
+        headers
             .get("x-tenant")
             .and_then(|value| value.to_str().ok())
-            .ok_or(Denied::MissingKey)?;
+            .ok_or(Denied::MissingKey)
+    }
+}
+
+impl Identify for ByTenant {
+    fn precheck(
+        &self,
+        _peer: std::net::IpAddr,
+        headers: &axum::http::HeaderMap,
+    ) -> Result<(), Denied> {
+        Self::tenant(headers).map(|_| ())
+    }
+
+    fn identify(&self, caller: Caller<'_>) -> Result<Identity, Denied> {
+        let tenant = Self::tenant(caller.headers)?;
         let client = ClientId(tenant.bytes().fold(0u32, |hash, byte| {
             hash.wrapping_mul(31).wrapping_add(u32::from(byte))
         }));
@@ -67,15 +77,11 @@ impl Identify for ByTenant {
         } else {
             ClassId(0)
         };
-        Ok(IdentifyResult::Identified(Identity {
+        Ok(Identity {
             client,
             name: Arc::from(tenant),
             class,
-        }))
-    }
-
-    fn identify_body(&self, _state: IntermediateState, _body: &Value) -> Result<Identity, Denied> {
-        Err(Denied::MissingKey)
+        })
     }
 }
 

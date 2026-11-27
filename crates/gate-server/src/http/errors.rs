@@ -110,3 +110,10 @@ pub(super) fn error_with_code(
     )
         .into_response()
 }
+
+pub(super) fn with_request_id(mut response: Response, request_id: &str) -> Response {
+    if let Ok(value) = HeaderValue::from_str(request_id) {
+        response.headers_mut().insert(REQUEST_ID_HEADER, value);
+    }
+    response
+}

@@ -222,6 +222,8 @@ pub struct QueueConfig {
     pub order: QueueOrderKind,
     /// VTC cost of a prompt token.
     pub input_weight: f64,
+    /// VTC cost of a cached prompt token. Defaults to `0.1 * input_weight`.
+    pub cached_input_weight: Option<f64>,
     /// VTC cost of a generated token.
     pub output_weight: f64,
     pub backfill: BackfillConfig,
@@ -243,6 +245,7 @@ impl Default for QueueConfig {
         Self {
             order: QueueOrderKind::Vtc,
             input_weight: 1.0,
+            cached_input_weight: None,
             output_weight: 2.0,
             backfill: BackfillConfig::default(),
             keepalive_after: Span::secs(5),
@@ -291,6 +294,7 @@ pub enum VictimKind {
     LeastRecentlyUsed,
     Smallest,
     Largest,
+    CostBenefit,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -727,6 +731,11 @@ impl Config {
                 problems.push(format!("{name} must be a number of at least 0"));
             }
         }
+        if let Some(weight) = self.queue.cached_input_weight
+            && !(weight.is_finite() && weight >= 0.0)
+        {
+            problems.push("queue.cached_input_weight must be a number of at least 0".into());
+        }
         if !(self.queue.input_weight > 0.0 || self.queue.output_weight > 0.0) {
             problems.push("queue.input_weight and queue.output_weight cannot both be 0".into());
         }
@@ -890,6 +899,8 @@ mod tests {
         assert!(refused("[server]\nhealth_interval = \"0s\"").contains("health_interval"));
         assert!(refused("[clients]\nresolve_interval = \"0s\"").contains("resolve_interval"));
         assert!(refused("[queue]\ninput_weight = -1.0").contains("input_weight"));
+        assert!(refused("[queue]\ncached_input_weight = -0.1").contains("cached_input_weight"));
+        assert!(refused("[queue]\ncached_input_weight = nan").contains("cached_input_weight"));
         assert!(refused("[kv]\ncapacity = 1000\nmargin = 1000").contains("margin"));
         assert!(
             refused("[admission]\ndefault_generation = 100\nmax_generation = 50")
@@ -901,5 +912,11 @@ mod tests {
                 .validate()
                 .is_ok()
         );
+        let tuned = Config::from_toml(
+            "[queue]\ncached_input_weight = 0.25\n[eviction]\nvictim = \"cost_benefit\"\n",
+        )
+        .unwrap();
+        assert_eq!(tuned.queue.cached_input_weight, Some(0.25));
+        assert_eq!(tuned.eviction.victim, VictimKind::CostBenefit);
     }
 }

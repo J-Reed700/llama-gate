@@ -151,38 +151,46 @@ fn field(event: &mut Event, line: &[u8]) {
     }
 }
 
+fn parse_event_json(event: &Event) -> Option<Value> {
+    let data = event.data.as_deref()?;
+    if data.trim() == "[DONE]" {
+        return None;
+    }
+    serde_json::from_str(data).ok()
+}
+
 /// What `event` means for an API shaped like `wire`.
 pub fn classify(wire: Wire, event: &Event) -> Kind {
+    let value = parse_event_json(event);
+    classify_value(wire, event, value.as_ref())
+}
+
+fn classify_value(wire: Wire, event: &Event, value: Option<&Value>) -> Kind {
     let Some(data) = event.data.as_deref() else {
         return Kind::Other;
     };
     if data.trim() == "[DONE]" {
         return Kind::Done;
     }
-    let value: Option<Value> = serde_json::from_str(data).ok();
     if event.name.as_deref() == Some("error") {
-        return Kind::Error(
-            value
-                .as_ref()
-                .map_or_else(|| data.to_owned(), error_message),
-        );
+        return Kind::Error(value.map_or_else(|| data.to_owned(), error_message));
     }
     let Some(value) = value else {
         // Not JSON: nothing to tell it by, so it is treated as output.
         return Kind::Output;
     };
     if value.get("error").is_some_and(|error| !error.is_null()) {
-        return Kind::Error(error_message(&value));
+        return Kind::Error(error_message(value));
     }
     let kind = match wire {
-        Wire::OpenAiChat => choices_kind(&value, |choice| {
+        Wire::OpenAiChat => choices_kind(value, |choice| {
             let delta = choice.get("delta").unwrap_or(&Value::Null);
-            ["content", "reasoning_content", "refusal"]
+            ["content", "reasoning_content", "reasoning", "refusal"]
                 .iter()
                 .any(|key| non_empty_text(delta.get(*key)))
                 || non_empty_array(delta.get("tool_calls"))
         }),
-        Wire::OpenAiCompletion => choices_kind(&value, |choice| non_empty_text(choice.get("text"))),
+        Wire::OpenAiCompletion => choices_kind(value, |choice| non_empty_text(choice.get("text"))),
         Wire::Llama => {
             if non_empty_text(value.get("content"))
                 || non_empty_array(value.get("tokens"))
@@ -195,7 +203,7 @@ pub fn classify(wire: Wire, event: &Event) -> Kind {
         }
         Wire::Responses => match value.get("type").and_then(Value::as_str) {
             Some("response.created" | "response.in_progress") => Kind::Preamble,
-            Some("response.failed" | "error") => Kind::Error(error_message(&value)),
+            Some("response.failed" | "error") => Kind::Error(error_message(value)),
             _ => Kind::Output,
         },
         Wire::Anthropic => match event
@@ -271,13 +279,14 @@ fn absorb(wire: Wire, value: &Value, usage: &mut Usage) {
     if let Some(timings) = value.get("timings") {
         let field = |key: &str| timings.get(key).and_then(Value::as_u64);
         if let Some(evaluated) = field("prompt_n") {
-            usage.prompt = Some(evaluated + field("cache_n").unwrap_or(0));
+            usage.prompt = Some(evaluated.saturating_add(field("cache_n").unwrap_or(0)));
         }
         usage.cached = field("cache_n").or(usage.cached);
         usage.generated = field("predicted_n").or(usage.generated);
         usage.decode_ms = timings
             .get("predicted_ms")
             .and_then(Value::as_f64)
+            .filter(|ms| ms.is_finite() && *ms >= 0.0)
             .or(usage.decode_ms);
     }
     match wire {
@@ -301,18 +310,24 @@ fn absorb(wire: Wire, value: &Value, usage: &mut Usage) {
         }
         Wire::Anthropic => {
             // Input in `message_start`, output in the final `message_delta`
-            // (or both at the top level of a whole message). Cache reads
-            // are counted apart from the rest of the input.
+            // (or both at the top level of a whole message). Cache reads and
+            // cache creations are counted apart from `input_tokens`.
             let reported = value
                 .pointer("/message/usage")
                 .or_else(|| value.get("usage"));
             if let Some(reported) = reported {
                 let field = |key: &str| reported.get(key).and_then(Value::as_u64);
-                let cached = field("cache_read_input_tokens");
-                if let Some(input) = field("input_tokens") {
-                    fill(&mut usage.prompt, Some(input + cached.unwrap_or(0)));
+                let input = field("input_tokens");
+                let cache_read = field("cache_read_input_tokens");
+                let cache_creation = field("cache_creation_input_tokens");
+                if input.is_some() || cache_read.is_some() || cache_creation.is_some() {
+                    let total = input
+                        .unwrap_or(0)
+                        .saturating_add(cache_read.unwrap_or(0))
+                        .saturating_add(cache_creation.unwrap_or(0));
+                    fill(&mut usage.prompt, Some(total));
                 }
-                fill(&mut usage.cached, cached);
+                fill(&mut usage.cached, cache_read);
                 // The opening event's count is a placeholder; the last wins.
                 if let Some(output) = field("output_tokens")
                     && value.pointer("/message/usage").is_none()
@@ -351,6 +366,16 @@ fn fill(slot: &mut Option<u64>, value: Option<u64>) {
     }
 }
 
+fn is_synthetic_usage_only(wire: Wire, value: &Value) -> bool {
+    matches!(wire, Wire::OpenAiChat | Wire::OpenAiCompletion)
+        && value.get("choices").is_none_or(|choices| {
+            choices.is_null() || choices.as_array().is_some_and(Vec::is_empty)
+        })
+        && value.get("usage").is_some_and(|usage| !usage.is_null())
+        && value.get("error").is_none_or(Value::is_null)
+        && value.get("prompt_progress").is_none()
+}
+
 /// Reads a streamed response: frames its events, says what each means, and
 /// keeps the usage and any failure it reports.
 #[derive(Clone, Debug)]
@@ -359,6 +384,7 @@ pub struct Reader {
     splitter: Splitter,
     usage: Usage,
     failure: Option<String>,
+    strip_usage_only: bool,
 }
 
 impl Reader {
@@ -368,7 +394,15 @@ impl Reader {
             splitter: Splitter::default(),
             usage: Usage::default(),
             failure: None,
+            strip_usage_only: false,
         }
+    }
+
+    /// When `true`, suppresses emitting synthetic OpenAI usage-only chunks
+    /// while still absorbing their `usage` and `timings`.
+    pub fn strip_usage_only(mut self, strip: bool) -> Self {
+        self.strip_usage_only = strip;
+        self
     }
 
     /// Reads a chunk; returns the complete events it finishes, in order.
@@ -376,21 +410,23 @@ impl Reader {
         self.splitter
             .split(chunk)
             .into_iter()
-            .map(|(bytes, event)| {
-                let kind = classify(self.wire, &event);
-                if let Some(value) = event
-                    .data
-                    .as_deref()
-                    .and_then(|data| serde_json::from_str::<Value>(data).ok())
-                {
-                    absorb(self.wire, &value, &mut self.usage);
+            .filter_map(|(bytes, event)| {
+                let value = parse_event_json(&event);
+                let kind = classify_value(self.wire, &event, value.as_ref());
+                if let Some(value) = value.as_ref() {
+                    absorb(self.wire, value, &mut self.usage);
                 }
                 if let Kind::Error(message) = &kind
                     && self.failure.is_none()
                 {
                     self.failure = Some(message.clone());
                 }
-                Piece { bytes, kind }
+                let strip = self.strip_usage_only
+                    && kind == Kind::Other
+                    && value
+                        .as_ref()
+                        .is_some_and(|value| is_synthetic_usage_only(self.wire, value));
+                (!strip).then_some(Piece { bytes, kind })
             })
             .collect()
     }
@@ -665,5 +701,152 @@ mod tests {
             (usage.prompt, usage.cached, usage.generated),
             (Some(20), Some(15), Some(4))
         );
+    }
+
+    #[test]
+    fn strip_usage_only_absorbs_usage_while_preserving_standard_chunks() {
+        let sse = concat!(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"}}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\"hmm\"}}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":40,\"completion_tokens\":5,\"prompt_tokens_details\":{\"cached_tokens\":30}},\"timings\":{\"cache_n\":30,\"prompt_n\":10,\"predicted_n\":5,\"predicted_ms\":50.0}}\n\n",
+            "data: [DONE]\n\n",
+        );
+
+        // Strip enabled: synthetic usage chunk is suppressed, usage & timings are still recorded,
+        // and split TCP boundaries still work.
+        let mut stripped = Reader::new(Wire::OpenAiChat).strip_usage_only(true);
+        let mut pieces = Vec::new();
+        for chunk in sse.as_bytes().chunks(7) {
+            pieces.extend(stripped.read(chunk));
+        }
+        let kinds: Vec<Kind> = pieces.iter().map(|piece| piece.kind.clone()).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                Kind::Preamble,
+                Kind::Output,
+                Kind::Output,
+                Kind::Output,
+                Kind::Done
+            ]
+        );
+        assert_eq!(
+            stripped.usage(),
+            Usage {
+                prompt: Some(40),
+                cached: Some(30),
+                generated: Some(5),
+                decode_ms: Some(50.0),
+            }
+        );
+
+        // Strip disabled (default): usage chunk is emitted as Kind::Other.
+        let mut kept = Reader::new(Wire::OpenAiChat).strip_usage_only(false);
+        let kept_pieces = kept.read(sse.as_bytes());
+        let kept_kinds: Vec<Kind> = kept_pieces.iter().map(|piece| piece.kind.clone()).collect();
+        assert_eq!(
+            kept_kinds,
+            vec![
+                Kind::Preamble,
+                Kind::Output,
+                Kind::Output,
+                Kind::Output,
+                Kind::Other,
+                Kind::Done
+            ]
+        );
+        assert_eq!(kept.usage(), stripped.usage());
+    }
+
+    #[test]
+    fn strip_usage_only_never_swallows_errors_progress_finish_or_completions_output() {
+        // Legacy completions: text chunk, finish chunk, usage-only chunk, [DONE].
+        let completions_sse = concat!(
+            "data: {\"choices\":[{\"index\":0,\"text\":\"hello\",\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"text\":\"\",\"finish_reason\":\"stop\"}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":3}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let mut reader = Reader::new(Wire::OpenAiCompletion).strip_usage_only(true);
+        let pieces: Vec<Piece> = completions_sse
+            .as_bytes()
+            .chunks(5)
+            .flat_map(|chunk| reader.read(chunk))
+            .collect();
+        assert_eq!(
+            pieces
+                .iter()
+                .map(|piece| piece.kind.clone())
+                .collect::<Vec<_>>(),
+            vec![Kind::Output, Kind::Output, Kind::Done]
+        );
+        assert_eq!(reader.usage().prompt, Some(12));
+        assert_eq!(reader.usage().generated, Some(3));
+
+        // Mid-stream error or prompt_progress even with choices: [] and usage present must NOT be stripped.
+        let special = concat!(
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":5},\"prompt_progress\":{\"total\":5,\"processed\":5}}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":5},\"error\":{\"message\":\"boom\"}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let mut reader = Reader::new(Wire::OpenAiChat).strip_usage_only(true);
+        let kinds: Vec<Kind> = reader
+            .read(special.as_bytes())
+            .into_iter()
+            .map(|piece| piece.kind)
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![Kind::Preamble, Kind::Error("boom".into()), Kind::Done]
+        );
+        assert_eq!(reader.failure(), Some("boom"));
+
+        // Omitted or null `choices` with usage present are also stripped cleanly.
+        for chunk in [
+            "data: {\"usage\":{\"prompt_tokens\":14,\"completion_tokens\":2}}\n\n",
+            "data: {\"choices\":null,\"usage\":{\"prompt_tokens\":15,\"completion_tokens\":3}}\n\n",
+        ] {
+            let sse = format!(
+                "data: {{\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"ok\"}}}}]}}\n\n{chunk}data: [DONE]\n\n"
+            );
+            let mut reader = Reader::new(Wire::OpenAiChat).strip_usage_only(true);
+            let kinds: Vec<Kind> = reader
+                .read(sse.as_bytes())
+                .into_iter()
+                .map(|piece| piece.kind)
+                .collect();
+            assert_eq!(kinds, vec![Kind::Output, Kind::Done]);
+            assert!(reader.usage().prompt.is_some());
+            assert!(reader.usage().generated.is_some());
+        }
+    }
+
+    #[test]
+    fn anthropic_accounts_cache_creation_and_cache_read_without_double_counting() {
+        let mut reader = Reader::new(Wire::Anthropic);
+        for event in [
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":50,\"cache_creation_input_tokens\":300,\"cache_read_input_tokens\":650,\"output_tokens\":1}}}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n",
+            "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"input_tokens\":50,\"cache_creation_input_tokens\":300,\"cache_read_input_tokens\":650,\"output_tokens\":9}}\n\n",
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        ] {
+            reader.read(event.as_bytes());
+        }
+        assert_eq!(
+            reader.usage(),
+            Usage {
+                prompt: Some(1_000),
+                cached: Some(650),
+                generated: Some(9),
+                decode_ms: None,
+            }
+        );
+
+        let whole = br#"{"type":"message","usage":{"input_tokens":50,"cache_creation_input_tokens":300,"cache_read_input_tokens":650,"output_tokens":9}}"#;
+        let mut whole_reader = WholeReader::new(Wire::Anthropic);
+        whole_reader.read(whole);
+        assert_eq!(whole_reader.usage(), reader.usage());
     }
 }

@@ -120,7 +120,7 @@ docker run -d -p 8080:8080 \
   ghcr.io/j-reed700/llama-gate
 ```
 
-**From source,** with Rust 1.88 or newer:
+**From source,** with Rust 1.89 or newer:
 
 ```sh
 cargo install --locked --git https://github.com/J-Reed700/llama-gate llama-gate
@@ -258,7 +258,8 @@ llama-server's.
 | Embeddings | `/v1/embeddings`, `/embeddings`, `/embedding` | scheduled |
 | Reranking | `/v1/rerank`, `/rerank`, `/v1/reranking`, `/reranking` | scheduled |
 | Slot actions | `POST /slots/{id}?action=...` | refused with 403: the gate manages slots |
-| Everything else | `/v1/models`, `/health`, `/props`, `/tokenize`, `/metrics`, `GET /slots`, ... | forwarded as is |
+| Model lookup | `GET /v1/models`, `GET /v1/models/{model}` | answered by the gate (or relayed on one backend for `/v1/models`) |
+| Everything else | `/health`, `/props`, `/tokenize`, `/metrics`, `GET /slots`, ... | forwarded as is |
 
 For example:
 
@@ -289,7 +290,10 @@ Every refusal carries an `x-gate-rejected-reason` header: `too_large`,
 `timeout`, `queue_full`, `unavailable`, or `shutting_down`. Error bodies use
 OpenAI's shape: `{"error": {"message", "type", "code"}}`. Once a waiting
 stream has started, a later refusal arrives in the stream as an SSE `error`
-event instead, the way llama.cpp reports errors mid-stream.
+event instead, the way llama.cpp reports errors mid-stream. Every request also
+carries an `x-request-id` (kept if valid printable ASCII up to 128 bytes,
+otherwise generated as `req-<n>`), which is forwarded upstream, echoed on all
+responses and errors, and recorded in logs and `/gate/status`.
 
 ## Configuration
 
@@ -457,7 +461,7 @@ Classes may override `default_generation` and `max_generation`.
 mode = "swap"                   # or "discard"
 directory = "/var/lib/llama/slots"
 budget = "48GiB"                # disk for saved contexts; least recently used go first
-victim = "least_recently_used"  # or "smallest", "largest"
+victim = "least_recently_used"  # or "smallest", "largest", "cost_benefit"
 min_snapshot_tokens = 4096      # smaller contexts are cleared, not saved
 partial_reuse = true
 ```
@@ -478,9 +482,10 @@ Set `partial_reuse = false` to skip that learning.
 ### Fair queueing
 
 Within a priority, the waiting client that has received the least service
-goes next. Service is counted in tokens (`queue.input_weight` per prompt
-token, `queue.output_weight` per generated token) divided by the class's
-`weight`. A client that comes back after a quiet spell starts level with
+goes next. Service is counted in tokens (`queue.input_weight` per uncached
+prompt token, `queue.cached_input_weight` per cached prompt token — defaulting
+to `0.1 * input_weight` — and `queue.output_weight` per generated token) divided
+by the class's `weight`. A client that comes back after a quiet spell starts level with
 the busiest waiting clients rather than with credit saved up (Virtual Token
 Counter, OSDI '24). `order = "fifo"` serves strictly by arrival instead.
 
@@ -743,6 +748,8 @@ Named after vLLM and llm-d conventions, so existing dashboards translate.
 | `llama_gate_overruns_total` | counter | Contexts that finished larger than their reservation, by server |
 | `llama_gate_prompt_tokens_total` | counter | Prompt tokens admitted, by how they were measured (exact, incremental, estimated) |
 | `llama_gate_cached_prompt_tokens_total` | counter | Prompt tokens servers reused from their cache |
+| `llama_gate_prefix_cache_queries_total` | counter | Completed requests with prompt tokens checked for prefix cache reuse |
+| `llama_gate_prefix_cache_hits_total` | counter | Completed requests that reused at least one cached prompt token |
 | `llama_gate_generated_tokens_total` | counter | Tokens generated, by class |
 | `llama_gate_evictions_total` | counter | Idle contexts cleared to make room, by outcome |
 | `llama_gate_restores_total` | counter | Saved contexts restored, by outcome |
@@ -761,13 +768,16 @@ Named after vLLM and llm-d conventions, so existing dashboards translate.
 | `llama_gate_time_to_first_token_seconds` | histogram | Arrival to the first generated output reaching the client (progress events don't count) |
 | `llama_gate_request_duration_seconds` | histogram | Arrival to the end of the response |
 | `llama_gate_measure_seconds` | histogram | Time spent measuring prompts |
+| `llama_gate_time_per_output_token_seconds` | histogram | Time per output token after the first token (when at least two tokens are generated) |
+| `llama_gate_request_prefill_time_seconds` | histogram | Time spent in prefill from dispatch to the first output |
+| `llama_gate_request_decode_time_seconds` | histogram | Time spent decoding from the first output to completion |
 
 ### Logs
 
 One line per finished request (`observe.access_log`):
 
 ```
-INFO gate_server::runtime: done ticket=41 client=chat-ui class=interactive model="qwen" dialect="openai_chat" backend="gpu0" slot=1 outcome="ok" status=200 prompt=7452 cached=7104 generated=757 measure_ms=3 queue_ms=0 ttft_ms=412 total_ms=15211 tokens_per_second=52.4 preempted=0 bounced=0
+INFO gate_server::runtime: done ticket=41 request_id="req-41" client=chat-ui class=interactive model="qwen" dialect="openai_chat" backend="gpu0" slot=1 outcome="ok" status=200 prompt=7452 cached=7104 generated=757 measure_ms=3 queue_ms=0 ttft_ms=412 total_ms=15211 tokens_per_second=52.4 preempted=0 bounced=0
 ```
 
 `log_format = "json"` writes the same as JSON for log collectors, and
@@ -882,7 +892,7 @@ builder accepts your own:
 | Trait | Decides | Built in |
 | --- | --- | --- |
 | `gate_core::QueueOrder` | Who goes next among equal priorities | `Vtc`, `Fifo` |
-| `gate_core::EvictionOrder` | Which idle context gives way | `LeastRecentlyUsed`, `Smallest`, `Largest` |
+| `gate_core::EvictionOrder` | Which idle context gives way | `LeastRecentlyUsed`, `Smallest`, `Largest`, `CostBenefit` |
 | `gate_server::clients::Identify` | Who sent a request, its class, and whether it may be served | `Rules` (keys, networks, hosts, headers) |
 | `gate_llama::Dialect` | Where an API keeps its prompt, limit, and slot options | eight request formats |
 
@@ -934,7 +944,7 @@ cargo test --workspace --release
 docker build -t llama-gate .
 ```
 
-Rust 1.88 or newer. The workspace has three crates:
+Rust 1.89 or newer. The workspace has three crates:
 
 | Crate | Holds |
 | --- | --- |

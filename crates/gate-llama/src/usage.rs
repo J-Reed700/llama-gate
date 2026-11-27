@@ -34,7 +34,11 @@ impl Usage {
     /// Tokens the slot holds after the request: prompt plus generated.
     pub fn resident(&self, measured_prompt: u64) -> Option<u64> {
         let generated = self.generated?;
-        Some(self.prompt.unwrap_or(measured_prompt) + generated)
+        Some(
+            self.prompt
+                .unwrap_or(measured_prompt)
+                .saturating_add(generated),
+        )
     }
 }
 
@@ -79,11 +83,14 @@ impl Sniffer {
         if let Some(timings) = last_object(&text, "timings") {
             let field = |key: &str| timings.get(key).and_then(Value::as_u64);
             if let Some(evaluated) = field("prompt_n") {
-                usage.prompt = Some(evaluated + field("cache_n").unwrap_or(0));
+                usage.prompt = Some(evaluated.saturating_add(field("cache_n").unwrap_or(0)));
             }
             usage.cached = field("cache_n");
             usage.generated = field("predicted_n");
-            usage.decode_ms = timings.get("predicted_ms").and_then(Value::as_f64);
+            usage.decode_ms = timings
+                .get("predicted_ms")
+                .and_then(Value::as_f64)
+                .filter(|ms| ms.is_finite() && *ms >= 0.0);
         }
         if let Some(reported) = last_object(&text, "usage") {
             let field = |key: &str| reported.get(key).and_then(Value::as_u64);
@@ -94,8 +101,19 @@ impl Sniffer {
                 .and_then(Value::as_u64);
             usage.cached = usage.cached.or(cached);
             usage.prompt = usage.prompt.or_else(|| field("prompt_tokens")).or_else(|| {
-                // Anthropic counts cached input apart from the rest.
-                field("input_tokens").map(|input| input + cached.unwrap_or(0))
+                let input = field("input_tokens");
+                let cache_read = field("cache_read_input_tokens");
+                let cache_creation = field("cache_creation_input_tokens");
+                if cache_read.is_some() || cache_creation.is_some() {
+                    Some(
+                        input
+                            .unwrap_or(0)
+                            .saturating_add(cache_read.unwrap_or(0))
+                            .saturating_add(cache_creation.unwrap_or(0)),
+                    )
+                } else {
+                    input
+                }
             });
             usage.generated = usage
                 .generated
@@ -254,11 +272,32 @@ mod tests {
         let openai = sniff(&[
             "{\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":5,\"prompt_tokens_details\":{\"cached_tokens\":80}}}",
         ]);
-        assert_eq!(openai.cached, Some(80));
+        assert_eq!((openai.prompt, openai.cached), (Some(100), Some(80)));
+
+        let responses = sniff(&[
+            "{\"usage\":{\"input_tokens\":100000,\"input_tokens_details\":{\"cached_tokens\":99000},\"output_tokens\":12}}",
+        ]);
+        assert_eq!(
+            (responses.prompt, responses.cached, responses.generated),
+            (Some(100_000), Some(99_000), Some(12))
+        );
+
         let anthropic = sniff(&[
             "{\"usage\":{\"input_tokens\":20,\"cache_read_input_tokens\":80,\"output_tokens\":3}}",
         ]);
         assert_eq!((anthropic.prompt, anthropic.cached), (Some(100), Some(80)));
+
+        let anthropic_with_creation = sniff(&[
+            "{\"usage\":{\"input_tokens\":20,\"cache_creation_input_tokens\":30,\"cache_read_input_tokens\":80,\"output_tokens\":3}}",
+        ]);
+        assert_eq!(
+            (
+                anthropic_with_creation.prompt,
+                anthropic_with_creation.cached,
+                anthropic_with_creation.generated
+            ),
+            (Some(130), Some(80), Some(3))
+        );
     }
 
     #[test]

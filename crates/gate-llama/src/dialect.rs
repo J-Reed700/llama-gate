@@ -68,6 +68,12 @@ pub trait Dialect: Send + Sync + std::fmt::Debug {
         body.get("stream").and_then(Value::as_bool).unwrap_or(false)
     }
 
+    /// Requests token usage on streamed responses when the client did not
+    /// already ask for it; returns `true` if `body` was modified.
+    fn ensure_stream_usage(&self, _body: &mut Value) -> bool {
+        false
+    }
+
     /// How its responses are shaped: what counts as output in its stream,
     /// and where its token counts are. A dialect that does not say is read
     /// conservatively (any event is output).
@@ -170,12 +176,18 @@ impl Dialects {
 const LIMIT_FIELDS: [&str; 3] = ["n_predict", "max_completion_tokens", "max_tokens"];
 
 /// The limit set by the first of `fields` present in `object`: `Some(None)`
-/// for a negative value (no limit), `None` when none is present.
+/// for a negative integer (no limit), `None` when none is present.
 fn first_limit(object: &Value, fields: &[&str]) -> Option<Option<u64>> {
     fields.iter().find_map(|key| {
         let value = object.get(*key)?;
-        let limit = value.as_i64()?;
-        Some(u64::try_from(limit).ok())
+        if let Some(limit) = value.as_u64() {
+            Some(Some(limit))
+        } else if value.as_i64().is_some() {
+            // Negative integers mean "until context is full" in llama.cpp.
+            Some(None)
+        } else {
+            None
+        }
     })
 }
 
@@ -277,6 +289,30 @@ fn media_parts(messages: Option<&Value>) -> u64 {
     })
 }
 
+/// Ensures `stream_options.include_usage` is `true`, preserving any other keys
+/// in an existing `stream_options` object. Returns `true` if `body` changed.
+fn inject_stream_usage(body: &mut Value) -> bool {
+    let Some(object) = body.as_object_mut() else {
+        return false;
+    };
+    if object
+        .get("stream_options")
+        .and_then(|options| options.get("include_usage"))
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
+        return false;
+    }
+    let options = object.entry("stream_options").or_insert_with(|| json!({}));
+    if !options.is_object() {
+        *options = json!({});
+    }
+    if let Some(map) = options.as_object_mut() {
+        map.insert("include_usage".into(), Value::Bool(true));
+    }
+    true
+}
+
 /// OpenAI chat completions (`/v1/chat/completions`).
 #[derive(Clone, Copy, Debug, Default)]
 pub struct OpenAiChat;
@@ -309,6 +345,10 @@ impl Dialect for OpenAiChat {
     fn limit_generation(&self, body: &mut Value, tokens: u64) {
         set_completion_limit(body, tokens);
     }
+
+    fn ensure_stream_usage(&self, body: &mut Value) -> bool {
+        self.streaming(body) && inject_stream_usage(body)
+    }
 }
 
 /// OpenAI legacy completions (`/v1/completions`).
@@ -338,6 +378,10 @@ impl Dialect for OpenAiCompletions {
 
     fn limit_generation(&self, body: &mut Value, tokens: u64) {
         set_completion_limit(body, tokens);
+    }
+
+    fn ensure_stream_usage(&self, body: &mut Value) -> bool {
+        self.streaming(body) && inject_stream_usage(body)
     }
 }
 
@@ -1052,6 +1096,127 @@ mod tests {
             AnthropicMessages
                 .error_event("overloaded_error", "busy")
                 .starts_with("event: error\n")
+        );
+    }
+
+    #[test]
+    fn ensure_stream_usage_injects_only_when_streaming_and_missing() {
+        for dialect in [&OpenAiChat as &dyn Dialect, &OpenAiCompletions] {
+            // Absent stream_options on streaming request -> injects and returns true.
+            let mut absent = json!({"stream": true, "messages": []});
+            assert!(dialect.ensure_stream_usage(&mut absent));
+            assert_eq!(absent["stream_options"], json!({"include_usage": true}));
+
+            // Existing object with extra keys -> preserves extra keys.
+            let mut extra = json!({
+                "stream": true,
+                "stream_options": {"continuous_usage_stats": true}
+            });
+            assert!(dialect.ensure_stream_usage(&mut extra));
+            assert_eq!(
+                extra["stream_options"],
+                json!({"continuous_usage_stats": true, "include_usage": true})
+            );
+
+            // Explicit include_usage: false -> flips to true, preserving extra keys.
+            let mut disabled = json!({
+                "stream": true,
+                "stream_options": {"include_usage": false, "other": 7}
+            });
+            assert!(dialect.ensure_stream_usage(&mut disabled));
+            assert_eq!(
+                disabled["stream_options"],
+                json!({"include_usage": true, "other": 7})
+            );
+
+            // Explicit include_usage: true -> untouched, returns false.
+            let mut enabled = json!({
+                "stream": true,
+                "stream_options": {"include_usage": true, "other": 7}
+            });
+            let before = enabled.clone();
+            assert!(!dialect.ensure_stream_usage(&mut enabled));
+            assert_eq!(enabled, before);
+
+            // Malformed stream_options (null/bool/array/string) -> replaced cleanly.
+            for bad in [json!(null), json!(false), json!([]), json!("bad")] {
+                let mut malformed = json!({"stream": true, "stream_options": bad});
+                assert!(dialect.ensure_stream_usage(&mut malformed));
+                assert_eq!(malformed["stream_options"], json!({"include_usage": true}));
+            }
+
+            // Non-streaming or non-bool stream -> untouched, returns false.
+            for mut non_stream in [
+                json!({"messages": []}),
+                json!({"stream": false}),
+                json!({"stream": "true"}),
+                json!(null),
+            ] {
+                let before = non_stream.clone();
+                assert!(!dialect.ensure_stream_usage(&mut non_stream));
+                assert_eq!(non_stream, before);
+            }
+        }
+
+        // Other dialects never modify the request.
+        for dialect in [
+            &OpenAiResponses as &dyn Dialect,
+            &AnthropicMessages,
+            &NativeCompletion,
+            &Infill,
+            &Embeddings,
+            &Rerank,
+        ] {
+            let mut body = json!({"stream": true});
+            assert!(!dialect.ensure_stream_usage(&mut body));
+            assert_eq!(body, json!({"stream": true}));
+        }
+    }
+
+    #[test]
+    fn generation_limits_handle_large_integers_floats_and_non_numbers() {
+        // Values above i64::MAX must not be misread as unlimited (None).
+        let huge = json!({"n_predict": u64::MAX});
+        assert_eq!(OpenAiChat.requested_generation(&huge), Some(u64::MAX));
+        let huge_anthropic = json!({"max_tokens": u64::MAX});
+        assert_eq!(
+            AnthropicMessages.requested_generation(&huge_anthropic),
+            Some(u64::MAX)
+        );
+        let huge_responses = json!({"max_output_tokens": u64::MAX});
+        assert_eq!(
+            OpenAiResponses.requested_generation(&huge_responses),
+            Some(u64::MAX)
+        );
+
+        // Non-integers (float, string, null, bool) are skipped cleanly.
+        let mixed = json!({
+            "n_predict": null,
+            "max_completion_tokens": 12.5,
+            "max_tokens": 256
+        });
+        assert_eq!(OpenAiChat.requested_generation(&mixed), Some(256));
+
+        let invalid = json!({
+            "n_predict": "100",
+            "max_completion_tokens": 1e30,
+            "max_tokens": true
+        });
+        assert_eq!(OpenAiChat.requested_generation(&invalid), None);
+
+        // Negative limits mean unlimited across dialects.
+        assert_eq!(
+            AnthropicMessages.requested_generation(&json!({"max_tokens": -1})),
+            None
+        );
+        assert_eq!(
+            OpenAiResponses.requested_generation(&json!({"max_output_tokens": -1})),
+            None
+        );
+        assert_eq!(
+            OpenAiChat
+                .requested_generation(&json!({"max_completion_tokens": -1, "max_tokens": 10})),
+            None
         );
     }
 }

@@ -7,7 +7,7 @@
 //! work before its output begins (it waits, then resumes where it stopped).
 //! The client sees one response throughout, and however the session ends it
 //! is reported to the engine exactly once. Everything else passes through.
-use crate::clients::{Identify, IdentifyResult, Identity, Names};
+use crate::clients::{Caller, Identify, Identity, Names};
 use crate::config::{Config, Mode};
 use crate::control::Control;
 use crate::engine::{Arrival, BackendLink, Grant, Handle, Report};
@@ -59,6 +59,7 @@ pub struct AppState {
     /// The program supplied its own identification: reloads keep it.
     pub custom_identify: bool,
     pub tickets: AtomicU64,
+    pub request_ids: AtomicU64,
     /// Bytes of request bodies held by requests in the gate.
     pub held: Arc<AtomicU64>,
     /// The configuration file, for reloads.
@@ -124,7 +125,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route(&format!("{prefix}/health"), get(health))
         .route(&format!("{prefix}/events"), get(events))
         .route(&format!("{prefix}/reload"), post(reload))
-        .route("/v1/models", get(models));
+        .route("/v1/models", get(models))
+        .route("/v1/models/{*model}", get(model_info));
     if config.observe.dashboard {
         let to = format!("{prefix}/");
         router = router
@@ -140,84 +142,113 @@ pub fn router(state: Arc<AppState>) -> Router {
     router.fallback(proxy).with_state(state)
 }
 
+pub(super) const REQUEST_ID_HEADER: HeaderName = HeaderName::from_static("x-request-id");
+
+pub(super) fn request_id_for(state: &AppState, headers: &HeaderMap) -> String {
+    if let Some(value) = headers.get(&REQUEST_ID_HEADER)
+        && let Some(valid) = valid_request_id(value)
+    {
+        return valid.to_owned();
+    }
+    let next = state.request_ids.fetch_add(1, Ordering::Relaxed) + 1;
+    format!("req-{next}")
+}
+
+fn valid_request_id(value: &HeaderValue) -> Option<&str> {
+    let bytes = value.as_bytes();
+    ((1..=128).contains(&bytes.len()) && bytes.iter().all(|byte| (0x21..=0x7E).contains(byte)))
+        .then(|| std::str::from_utf8(bytes).ok())
+        .flatten()
+}
+
 async fn proxy(
     State(state): State<Arc<AppState>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     request: Request,
-) -> Result<Response, Response> {
+) -> Response {
     // One snapshot for the whole request: a reload meanwhile cannot pair
     // this configuration with other rules.
     let live = state.live();
     let config = live.config.clone();
     let (parts, body) = request.into_parts();
     let peer_ip = peer.ip();
-
-    let identity_result = match live.identify.identify_headers(&parts.headers, peer_ip) {
-        Ok(res) => res,
-        Err(denied) => {
-            return Err(error(
-                StatusCode::UNAUTHORIZED,
-                "authentication_error",
-                denied.message().into(),
-            ));
-        }
-    };
-
-    let max_body = config.server.max_body.0 as usize;
-    let (identity, bytes, body) = match identity_result {
-        IdentifyResult::Identified(identity) => (identity, Bytes::new(), Value::Null),
-        IdentifyResult::NeedsBody(state) => {
-            let bytes =
-                match tokio::time::timeout(config.server.body_timeout.0, to_bytes(body, max_body))
-                    .await
-                {
-                    Ok(Ok(bytes)) => bytes,
-                    Ok(Err(_)) => {
-                        return Err(error(
-                            StatusCode::PAYLOAD_TOO_LARGE,
-                            "invalid_request_error",
-                            format!("request body exceeds {}", config.server.max_body),
-                        ));
-                    }
-                    Err(_) => {
-                        return Err(error(
-                            StatusCode::REQUEST_TIMEOUT,
-                            "invalid_request_error",
-                            "the request body did not arrive in time".into(),
-                        ));
-                    }
-                };
-            let body = if parts.method == Method::POST {
-                serde_json::from_slice(&bytes).unwrap_or(Value::Null)
-            } else {
-                Value::Null
-            };
-            let identity = live
-                .identify
-                .identify_body(state, &body)
-                .map_err(|denied| {
-                    error(
-                        StatusCode::UNAUTHORIZED,
-                        "authentication_error",
-                        denied.message().into(),
-                    )
-                })?;
-            (identity, bytes, body)
-        }
-    };
-
     let mode = config.server.mode;
+    let request_id = request_id_for(&state, &parts.headers);
+
     if mode != Mode::Bypass
         && is_slot_action(&parts.method, parts.uri.path())
         && !config.server.allow_slot_actions
     {
-        return Err(error(
-            StatusCode::FORBIDDEN,
-            "permission_error",
-            "slot actions are managed by llama-gate (set server.allow_slot_actions to permit them)"
-                .into(),
-        ));
+        return with_request_id(
+            error(
+                StatusCode::FORBIDDEN,
+                "permission_error",
+                "slot actions are managed by llama-gate (set server.allow_slot_actions to permit them)"
+                    .into(),
+            ),
+            &request_id,
+        );
     }
+
+    if let Err(denied) = live.identify.precheck(peer_ip, &parts.headers) {
+        return with_request_id(
+            error(
+                StatusCode::UNAUTHORIZED,
+                "authentication_error",
+                denied.message().into(),
+            ),
+            &request_id,
+        );
+    }
+
+    let max_body = config.server.max_body.0 as usize;
+    let bytes =
+        match tokio::time::timeout(config.server.body_timeout.0, to_bytes(body, max_body)).await {
+            Ok(Ok(bytes)) => bytes,
+            Ok(Err(_)) => {
+                return with_request_id(
+                    error(
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        "invalid_request_error",
+                        format!("request body exceeds {}", config.server.max_body),
+                    ),
+                    &request_id,
+                );
+            }
+            Err(_) => {
+                return with_request_id(
+                    error(
+                        StatusCode::REQUEST_TIMEOUT,
+                        "invalid_request_error",
+                        "the request body did not arrive in time".into(),
+                    ),
+                    &request_id,
+                );
+            }
+        };
+    let body = if parts.method == Method::POST {
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null)
+    } else {
+        Value::Null
+    };
+    let identity = match live.identify.identify(Caller {
+        peer: peer_ip,
+        headers: &parts.headers,
+        body: &body,
+    }) {
+        Ok(identity) => identity,
+        Err(denied) => {
+            return with_request_id(
+                error(
+                    StatusCode::UNAUTHORIZED,
+                    "authentication_error",
+                    denied.message().into(),
+                ),
+                &request_id,
+            );
+        }
+    };
+
     let dialect = (mode != Mode::Bypass && parts.method == Method::POST)
         .then(|| state.dialects.find(parts.uri.path()))
         .flatten();
@@ -231,13 +262,12 @@ async fn proxy(
     let (Some(dialect), true) = (dialect, body.is_object()) else {
         // Not scheduled: pass through to a server of the requested model.
         let Some(link) = state.backend_for(model) else {
-            return Err(error(
-                StatusCode::BAD_GATEWAY,
-                "server_error",
-                "no backend".into(),
-            ));
+            return with_request_id(
+                error(StatusCode::BAD_GATEWAY, "server_error", "no backend".into()),
+                &request_id,
+            );
         };
-        return Ok(relay(
+        return relay(
             &state,
             &link,
             &parts.method,
@@ -246,26 +276,31 @@ async fn proxy(
             peer,
             bytes,
             owns_key,
+            &request_id,
         )
-        .await);
+        .await;
     };
     let Some(model) = model else {
-        return Err(error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "server_error",
-            "no models are configured".into(),
-        ));
+        return with_request_id(
+            error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "server_error",
+                "no models are configured".into(),
+            ),
+            &request_id,
+        );
     };
     // From here the parsed body is all the request needs.
     let size = bytes.len();
     drop(bytes);
     let Some(held) = Held::take(&state.held, size as u64, config.server.max_held_bytes.0) else {
-        return Ok(busy(config.queue.retry_after.0));
+        return with_request_id(busy(config.queue.retry_after.0), &request_id);
     };
-    Ok(generate(
+    generate(
         state, config, parts, peer, dialect, body, size, held, identity, model, owns_key,
+        request_id,
     )
-    .await)
+    .await
 }
 
 /// Bytes of request bodies held by requests in the gate (each keeps its
@@ -358,5 +393,31 @@ mod tests {
             Some("ggml-org/gemma:Q4")
         );
         assert_eq!(query_value(&uri, "missing"), None);
+    }
+
+    #[test]
+    fn request_id_validation_accepts_printable_ascii_and_rejects_control_or_oversized() {
+        assert_eq!(
+            valid_request_id(&HeaderValue::from_static("req_abc-123.XYZ")),
+            Some("req_abc-123.XYZ")
+        );
+        let max = "a".repeat(128);
+        assert_eq!(
+            valid_request_id(&HeaderValue::from_str(&max).unwrap()),
+            Some(max.as_str())
+        );
+        assert_eq!(valid_request_id(&HeaderValue::from_static("")), None);
+        let too_long = "a".repeat(129);
+        assert_eq!(
+            valid_request_id(&HeaderValue::from_str(&too_long).unwrap()),
+            None
+        );
+        assert_eq!(valid_request_id(&HeaderValue::from_static("bad id")), None);
+        assert_eq!(valid_request_id(&HeaderValue::from_static("bad\tid")), None);
+        assert!(HeaderValue::from_bytes(b"bad\x7fid").is_err());
+        assert_eq!(
+            valid_request_id(&HeaderValue::from_bytes(b"bad\xc3\xa9").unwrap()),
+            None
+        );
     }
 }
