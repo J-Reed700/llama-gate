@@ -54,6 +54,7 @@ pub struct FakeState {
     /// Answers this many more generation requests with 503 "Loading model",
     /// as llama.cpp does while it loads.
     pub loading: AtomicU64,
+    pub request_ids: Mutex<Vec<String>>,
     next_task: AtomicI64,
     freed: Notify,
 }
@@ -106,6 +107,7 @@ impl Fake {
             peak: AtomicU64::new(0),
             model: model.into(),
             loading: AtomicU64::new(0),
+            request_ids: Mutex::new(Vec::new()),
             next_task: AtomicI64::new(0),
             freed: Notify::new(),
         });
@@ -175,7 +177,16 @@ async fn props(State(state): State<Arc<FakeState>>) -> Json<Value> {
     }))
 }
 
-async fn models(State(state): State<Arc<FakeState>>) -> Json<Value> {
+async fn models(
+    State(state): State<Arc<FakeState>>,
+    headers: axum::http::HeaderMap,
+) -> Json<Value> {
+    if let Some(id) = headers
+        .get("x-request-id")
+        .and_then(|value| value.to_str().ok())
+    {
+        state.request_ids.lock().unwrap().push(id.to_owned());
+    }
     Json(json!({"object": "list", "data": [{"id": state.model}]}))
 }
 
@@ -377,7 +388,17 @@ async fn embeddings(State(state): State<Arc<FakeState>>, Json(body): Json<Value>
     Json(json!({"object": "list", "data": data, "usage": {"prompt_tokens": inputs.iter().map(|input| words(input)).sum::<u64>()}})).into_response()
 }
 
-async fn chat(State(state): State<Arc<FakeState>>, Json(body): Json<Value>) -> Response {
+async fn chat(
+    State(state): State<Arc<FakeState>>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    if let Some(id) = headers
+        .get("x-request-id")
+        .and_then(|value| value.to_str().ok())
+    {
+        state.request_ids.lock().unwrap().push(id.to_owned());
+    }
     if state
         .loading
         .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
@@ -413,6 +434,17 @@ async fn chat(State(state): State<Arc<FakeState>>, Json(body): Json<Value>) -> R
                 .find_map(|word| word.strip_prefix("fail:"))
         })
         .and_then(|value| value.parse::<u64>().ok());
+    let cache_n = body["messages"]
+        .as_array()
+        .and_then(|messages| messages.last())
+        .and_then(|message| message["content"].as_str())
+        .and_then(|text| {
+            text.split_whitespace()
+                .find_map(|word| word.strip_prefix("cache:"))
+        })
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0)
+        .min(prompt);
     // As llama.cpp resolves it: the first of these present wins, and a
     // negative value means no limit.
     let limit = ["n_predict", "max_completion_tokens", "max_tokens"]
@@ -459,7 +491,7 @@ async fn chat(State(state): State<Arc<FakeState>>, Json(body): Json<Value>) -> R
         return Json(json!({
             "choices": [{"message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
             "usage": {"prompt_tokens": prompt, "completion_tokens": generate},
-            "timings": {"cache_n": 0, "prompt_n": prompt, "predicted_n": generate}
+            "timings": {"cache_n": cache_n, "prompt_n": prompt.saturating_sub(cache_n), "predicted_n": generate}
         }))
         .into_response();
     }
@@ -515,7 +547,7 @@ async fn chat(State(state): State<Arc<FakeState>>, Json(body): Json<Value>) -> R
                 state.completions.fetch_add(1, Ordering::SeqCst);
                 let chunk = format!(
                     "data: {}\n\ndata: [DONE]\n\n",
-                    json!({"choices": [{"delta": {}, "finish_reason": "stop"}], "timings": {"cache_n": 0, "prompt_n": prompt, "predicted_n": generate}})
+                    json!({"choices": [{"delta": {}, "finish_reason": "stop"}], "timings": {"cache_n": cache_n, "prompt_n": prompt.saturating_sub(cache_n), "predicted_n": generate}})
                 );
                 busy.done = true;
                 drop(busy);

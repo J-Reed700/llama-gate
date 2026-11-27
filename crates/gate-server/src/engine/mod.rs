@@ -78,6 +78,7 @@ pub struct Arrival {
 #[derive(Clone, Debug, Serialize)]
 pub struct Report {
     pub ticket: TicketId,
+    pub request_id: String,
     /// Milliseconds since the gate started; set by the engine.
     pub at_ms: Millis,
     pub client: Arc<str>,

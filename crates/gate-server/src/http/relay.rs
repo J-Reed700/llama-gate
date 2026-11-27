@@ -15,6 +15,7 @@ pub(super) fn upstream_request(
     peer: SocketAddr,
     body: Bytes,
     owns_key: bool,
+    request_id: &str,
 ) -> reqwest::RequestBuilder {
     let url = format!(
         "{}{}",
@@ -28,6 +29,7 @@ pub(super) fn upstream_request(
         let lowered = name.as_str();
         let credential = matches!(lowered, "authorization" | "x-api-key");
         if is_hop_by_hop(lowered)
+            || *name == REQUEST_ID_HEADER
             || strip
                 .iter()
                 .any(|strip| strip.eq_ignore_ascii_case(lowered))
@@ -39,6 +41,9 @@ pub(super) fn upstream_request(
     }
     if let Some(key) = &link.api_key {
         request = request.bearer_auth(key);
+    }
+    if let Ok(value) = HeaderValue::from_str(request_id) {
+        request = request.header(REQUEST_ID_HEADER, value);
     }
     request.header(
         HeaderName::from_static("x-forwarded-for"),
@@ -58,28 +63,37 @@ pub(super) async fn relay(
     peer: SocketAddr,
     body: Bytes,
     owns_key: bool,
+    request_id: &str,
 ) -> Response {
-    let request = upstream_request(state, link, method, uri, headers, peer, body, owns_key);
+    let request = upstream_request(
+        state, link, method, uri, headers, peer, body, owns_key, request_id,
+    );
     let response = match request.send().await {
         Ok(response) => response,
         Err(problem) => {
-            return error(
-                StatusCode::BAD_GATEWAY,
-                "server_error",
-                format!("upstream request failed: {problem}"),
+            return with_request_id(
+                error(
+                    StatusCode::BAD_GATEWAY,
+                    "server_error",
+                    format!("upstream request failed: {problem}"),
+                ),
+                request_id,
             );
         }
     };
     let status = response.status();
     let mut builder = Response::builder().status(status.as_u16());
     for (name, value) in response.headers() {
-        if !is_hop_by_hop(name.as_str()) {
+        if !is_hop_by_hop(name.as_str()) && *name != REQUEST_ID_HEADER {
             builder = builder.header(name.as_str(), value.as_bytes());
         }
     }
+    if let Ok(value) = HeaderValue::from_str(request_id) {
+        builder = builder.header(REQUEST_ID_HEADER, value);
+    }
     builder
         .body(Body::from_stream(response.bytes_stream()))
-        .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response())
+        .unwrap_or_else(|_| with_request_id(StatusCode::BAD_GATEWAY.into_response(), request_id))
 }
 
 pub(super) fn is_hop_by_hop(name: &str) -> bool {

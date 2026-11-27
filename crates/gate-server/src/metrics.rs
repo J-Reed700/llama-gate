@@ -42,6 +42,16 @@ const CATALOG: &[(&str, &str, &str)] = &[
         "Prompt tokens servers reused from their cache.",
     ),
     (
+        "llama_gate_prefix_cache_queries_total",
+        "counter",
+        "Requests with prompt tokens checked for prefix cache reuse.",
+    ),
+    (
+        "llama_gate_prefix_cache_hits_total",
+        "counter",
+        "Requests that reused at least one cached prompt token.",
+    ),
+    (
         "llama_gate_generated_tokens_total",
         "counter",
         "Tokens generated, by class.",
@@ -131,6 +141,18 @@ const HISTOGRAMS: &[(&str, &str)] = &[
         "llama_gate_measure_seconds",
         "Time spent measuring prompts (template and tokenization).",
     ),
+    (
+        "llama_gate_time_per_output_token_seconds",
+        "Time per output token after the first token.",
+    ),
+    (
+        "llama_gate_request_prefill_time_seconds",
+        "Time spent in prefill from dispatch to the first output.",
+    ),
+    (
+        "llama_gate_request_decode_time_seconds",
+        "Time spent decoding from the first output to completion.",
+    ),
 ];
 
 #[derive(Debug, Default)]
@@ -185,6 +207,9 @@ pub enum Timing {
     TimeToFirstToken = 1,
     Duration = 2,
     Measure = 3,
+    TimePerOutputToken = 4,
+    PrefillTime = 5,
+    DecodeTime = 6,
 }
 
 impl Metrics {
@@ -282,6 +307,11 @@ mod tests {
         );
         metrics.observe(Timing::QueueTime, 0.2);
         metrics.observe(Timing::TimeToFirstToken, 1.5);
+        metrics.observe(Timing::TimePerOutputToken, 0.04);
+        metrics.observe(Timing::PrefillTime, 0.4);
+        metrics.observe(Timing::DecodeTime, 0.8);
+        metrics.count("llama_gate_prefix_cache_queries_total", String::new(), 3);
+        metrics.count("llama_gate_prefix_cache_hits_total", String::new(), 2);
         let text = metrics.render();
         assert!(
             text.contains("llama_gate_requests_total{class=\"a\\\"b\",outcome=\"dispatched\"} 2"),
@@ -291,6 +321,11 @@ mod tests {
         assert!(text.contains("llama_gate_request_queue_time_seconds_bucket{le=\"0.25\"} 1"));
         assert!(text.contains("llama_gate_request_queue_time_seconds_bucket{le=\"0.1\"} 0"));
         assert!(text.contains("llama_gate_time_to_first_token_seconds_bucket{le=\"2.5\"} 1"));
+        assert!(text.contains("llama_gate_time_per_output_token_seconds_count 1"));
+        assert!(text.contains("llama_gate_request_prefill_time_seconds_count 1"));
+        assert!(text.contains("llama_gate_request_decode_time_seconds_count 1"));
+        assert!(text.contains("llama_gate_prefix_cache_queries_total 3"));
+        assert!(text.contains("llama_gate_prefix_cache_hits_total 2"));
         assert!(text.contains("# TYPE llama_gate_requests_waiting gauge"));
     }
 }

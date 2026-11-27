@@ -913,3 +913,301 @@ async fn bodies_held_past_the_budget_are_refused_until_some_finish() {
     let (status, body) = post(&gate.url, chat_body("third-", 200, 2, false)).await;
     assert_eq!(status, 200, "admitted once the first ended: {body}");
 }
+
+#[tokio::test]
+async fn authorized_post_with_api_key_reads_body_schedules_and_forwards_it() {
+    let fake = Fake::start(4_000, 1, None, Duration::from_millis(1)).await;
+    let mut config = quick(&fake.url);
+    config.auth.required = true;
+    config.auth.keys = vec![KeyConfig {
+        key: Secret::new("sk-app"),
+        client: "app".into(),
+        class: None,
+    }];
+    config.auth.admin_keys = vec![Secret::new("sk-admin")];
+    let gate = start(config, None, Some("sk-admin")).await;
+
+    // Wrong key is rejected before body read.
+    let (status, _) = send(
+        &gate.url,
+        "/v1/chat/completions",
+        chat_body("bad-", 25, 4, false),
+        &[("authorization", "Bearer sk-wrong")],
+    )
+    .await;
+    assert_eq!(status, 401);
+    assert_eq!(fake.state.completions.load(Ordering::SeqCst), 0);
+
+    // Authorized non-streaming and streaming POSTs read & schedule full body.
+    let (status, body) = send(
+        &gate.url,
+        "/v1/chat/completions",
+        chat_body("auth-", 30, 4, false),
+        &[("authorization", "Bearer sk-app")],
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+
+    let stream_response = reqwest::Client::new()
+        .post(format!("{}/v1/chat/completions", gate.url))
+        .bearer_auth("sk-app")
+        .json(&chat_body("auth-s-", 20, 3, true))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(stream_response.status(), 200);
+    let stream_text = stream_response.text().await.unwrap();
+    assert_eq!(stream_text.matches("\"t \"").count(), 3, "{stream_text}");
+    assert_eq!(fake.state.completions.load(Ordering::SeqCst), 2);
+
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    let status: Value = reqwest::Client::new()
+        .get(format!("{}/gate/status", gate.url))
+        .bearer_auth("sk-admin")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(status["clients"][0]["name"], "app");
+    assert_eq!(status["clients"][0]["prompt_tokens"], 50);
+    assert_eq!(status["recent"][0]["prompt"], 20);
+    assert_eq!(status["recent"][1]["prompt"], 30);
+}
+
+#[tokio::test]
+async fn models_lookup_handles_canonical_aliases_unknown_and_enforces_auth() {
+    let alpha = Fake::start_as("alpha", 4_000, 1, None, Duration::from_millis(1)).await;
+    let beta = Fake::start_as("beta", 4_000, 1, None, Duration::from_millis(1)).await;
+    let mut config = quick(&alpha.url);
+    config.auth.required = true;
+    config.auth.keys = vec![KeyConfig {
+        key: Secret::new("sk-app"),
+        client: "app".into(),
+        class: None,
+    }];
+    config.auth.admin_keys = vec![Secret::new("sk-admin")];
+    config.backends = vec![
+        BackendConfig {
+            name: "a".into(),
+            url: alpha.url.clone(),
+            model: "alpha".into(),
+            ..BackendConfig::default()
+        },
+        BackendConfig {
+            name: "b".into(),
+            url: beta.url.clone(),
+            model: "beta".into(),
+            aliases: vec!["b-model".into(), "org/beta-v2".into()],
+            ..BackendConfig::default()
+        },
+    ];
+    let gate = start(config, None, Some("sk-admin")).await;
+    let client = reqwest::Client::new();
+
+    // Unauthenticated requests are rejected identically on list and lookup.
+    for path in [
+        "/v1/models",
+        "/v1/models/alpha",
+        "/v1/models/missing",
+        "/v1/models/%2e%2e%2Falpha",
+    ] {
+        let resp = client
+            .get(format!("{}{path}", gate.url))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401, "{path}");
+    }
+    let wrong = client
+        .get(format!("{}/v1/models/alpha", gate.url))
+        .bearer_auth("sk-nope")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(wrong.status(), 401);
+
+    // Known canonical name.
+    let resp = client
+        .get(format!("{}/v1/models/alpha", gate.url))
+        .bearer_auth("sk-app")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(
+        body,
+        json!({"id": "alpha", "object": "model", "created": 0, "owned_by": "llama-gate"})
+    );
+
+    // Alias and slash-containing alias (direct and percent-encoded).
+    for path in [
+        "/v1/models/b-model",
+        "/v1/models/org/beta-v2",
+        "/v1/models/org%2Fbeta-v2",
+    ] {
+        let resp = client
+            .get(format!("{}{path}", gate.url))
+            .bearer_auth("sk-app")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "{path}");
+        let body: Value = resp.json().await.unwrap();
+        assert_eq!(body["id"], "beta", "{path}: {body}");
+        assert_eq!(body["owned_by"], "llama-gate");
+    }
+
+    // Unknown model returns 404 OpenAI invalid_request_error.
+    let missing = client
+        .get(format!("{}/v1/models/does-not-exist", gate.url))
+        .bearer_auth("sk-app")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), 404);
+    let missing_body: Value = missing.json().await.unwrap();
+    assert_eq!(missing_body["error"]["type"], "invalid_request_error");
+}
+
+#[tokio::test]
+async fn request_id_propagates_and_sanitizes_and_golden_metrics_are_recorded() {
+    let fake = Fake::start(4_000, 1, None, Duration::from_millis(5)).await;
+    fake.set_prefill(Duration::from_millis(20));
+    let gate = gate(&fake, |_| {}).await;
+    let client = reqwest::Client::new();
+
+    // 1. Valid x-request-id on scheduled request (non-streaming) with cache hit and >=2 tokens.
+    let mut cached_body = chat_body("m1-", 20, 4, false);
+    cached_body["messages"][0]["content"] = json!(format!(
+        "{} cache:5 gen:4",
+        (0..18)
+            .map(|i| format!("w{i}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    ));
+    let resp = client
+        .post(format!("{}/v1/chat/completions", gate.url))
+        .header("x-request-id", "trace-valid-1")
+        .json(&cached_body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.headers()
+            .get("x-request-id")
+            .and_then(|v| v.to_str().ok()),
+        Some("trace-valid-1")
+    );
+
+    // 2. Invalid x-request-id (contains space) is replaced on response & upstream; generated=1 skips TPOT.
+    let resp = client
+        .post(format!("{}/v1/chat/completions", gate.url))
+        .header("x-request-id", "bad request id")
+        .json(&chat_body("m2-", 10, 1, true))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let generated_id = resp
+        .headers()
+        .get("x-request-id")
+        .and_then(|v| v.to_str().ok())
+        .unwrap()
+        .to_owned();
+    assert!(generated_id.starts_with("req-"), "{generated_id}");
+    let _ = resp.text().await.unwrap();
+
+    // 3. Relayed request and error responses echo x-request-id.
+    let relayed = client
+        .get(format!("{}/v1/models", gate.url))
+        .header("x-request-id", "relay-id-9")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(relayed.status(), 200);
+    assert_eq!(
+        relayed
+            .headers()
+            .get("x-request-id")
+            .and_then(|v| v.to_str().ok()),
+        Some("relay-id-9")
+    );
+
+    let forbidden = client
+        .post(format!("{}/slots/0?action=erase", gate.url))
+        .header("x-request-id", "err-id-403")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(forbidden.status(), 403);
+    assert_eq!(
+        forbidden
+            .headers()
+            .get("x-request-id")
+            .and_then(|v| v.to_str().ok()),
+        Some("err-id-403")
+    );
+
+    let missing_model = client
+        .get(format!("{}/v1/models/unknown", gate.url))
+        .header("x-request-id", "err-id-404")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing_model.status(), 404);
+    assert_eq!(
+        missing_model
+            .headers()
+            .get("x-request-id")
+            .and_then(|v| v.to_str().ok()),
+        Some("err-id-404")
+    );
+
+    // Upstream received sanitized IDs, never the invalid one.
+    let upstream_ids = fake.state.request_ids.lock().unwrap().clone();
+    assert!(
+        upstream_ids.contains(&"trace-valid-1".to_owned()),
+        "{upstream_ids:?}"
+    );
+    assert!(upstream_ids.contains(&generated_id), "{upstream_ids:?}");
+    assert!(
+        upstream_ids.contains(&"relay-id-9".to_owned()),
+        "{upstream_ids:?}"
+    );
+    assert!(
+        !upstream_ids.iter().any(|id| id.contains("bad request")),
+        "{upstream_ids:?}"
+    );
+
+    // Report includes request_id.
+    let status = status_of(&gate).await;
+    assert_eq!(status["recent"][0]["request_id"], generated_id);
+    assert_eq!(status["recent"][1]["request_id"], "trace-valid-1");
+
+    // Golden serving metrics recorded in /gate/metrics.
+    let metrics = metrics_of(&gate).await;
+    assert!(
+        metrics.contains("llama_gate_time_per_output_token_seconds_count 1"),
+        "{metrics}"
+    );
+    assert!(
+        metrics.contains("llama_gate_request_prefill_time_seconds_count 2"),
+        "{metrics}"
+    );
+    assert!(
+        metrics.contains("llama_gate_request_decode_time_seconds_count 2"),
+        "{metrics}"
+    );
+    assert!(
+        metrics.contains("llama_gate_prefix_cache_queries_total 2"),
+        "{metrics}"
+    );
+    assert!(
+        metrics.contains("llama_gate_prefix_cache_hits_total 1"),
+        "{metrics}"
+    );
+}

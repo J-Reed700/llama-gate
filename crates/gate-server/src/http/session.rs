@@ -15,13 +15,17 @@ pub(super) async fn generate(
     identity: Identity,
     model: ModelId,
     owns_key: bool,
+    request_id: String,
 ) -> Response {
     let arrived = Instant::now();
     let Some(link) = state.backend_for(Some(model)) else {
-        return error(
-            StatusCode::BAD_GATEWAY,
-            "server_error",
-            "no backend serves this model".into(),
+        return with_request_id(
+            error(
+                StatusCode::BAD_GATEWAY,
+                "server_error",
+                "no backend serves this model".into(),
+            ),
+            &request_id,
         );
     };
     let measurer = link.measurer.borrow().clone();
@@ -67,6 +71,7 @@ pub(super) async fn generate(
 
     if config.server.mode == Mode::Observe {
         info!(
+            request_id = %request_id,
             client = %identity.name,
             class = %class_name,
             model = model_name,
@@ -86,6 +91,7 @@ pub(super) async fn generate(
             peer,
             bytes,
             owns_key,
+            &request_id,
         )
         .await;
     }
@@ -131,6 +137,7 @@ pub(super) async fn generate(
         dialect,
         body,
         owns_key,
+        request_id: request_id.clone(),
         arrived,
         waiting_since: Instant::now(),
         queued: Duration::ZERO,
@@ -139,6 +146,7 @@ pub(super) async fn generate(
         ended: false,
         report: Report {
             ticket,
+            request_id,
             at_ms: 0,
             client: identity.name,
             class: class_name,
@@ -194,6 +202,7 @@ pub(super) struct Session {
     requested: Option<Tokens>,
     generates: bool,
     owns_key: bool,
+    request_id: String,
     arrived: Instant,
     /// When the current wait for a grant began.
     waiting_since: Instant,
@@ -316,6 +325,7 @@ impl Session {
             self.peer,
             bytes,
             self.owns_key,
+            &self.request_id,
         );
         let control = self.control.clone();
         let outcome = tokio::select! {
@@ -355,9 +365,13 @@ impl Session {
         let status = response.status();
         let mut builder = Response::builder().status(status.as_u16());
         for (name, value) in response.headers() {
-            if !is_hop_by_hop(name.as_str()) {
+            if !is_hop_by_hop(name.as_str()) && *name != REQUEST_ID_HEADER {
                 builder = builder.header(name.as_str(), value.as_bytes());
             }
+        }
+        let request_id = self.request_id.clone();
+        if let Ok(value) = HeaderValue::from_str(&request_id) {
+            builder = builder.header(REQUEST_ID_HEADER, value);
         }
         let stream = Leased {
             inner: response.bytes_stream(),
@@ -365,9 +379,9 @@ impl Session {
             session: Some(self),
             status: status.as_u16(),
         };
-        builder
-            .body(Body::from_stream(stream))
-            .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response())
+        builder.body(Body::from_stream(stream)).unwrap_or_else(|_| {
+            with_request_id(StatusCode::BAD_GATEWAY.into_response(), &request_id)
+        })
     }
 
     /// Answers a streaming request whose server has answered: mirrors the
@@ -377,15 +391,19 @@ impl Session {
     fn commit_stream(self, response: reqwest::Response) -> Response {
         let mut builder = Response::builder().status(response.status().as_u16());
         for (name, value) in response.headers() {
-            if !is_hop_by_hop(name.as_str()) {
+            if !is_hop_by_hop(name.as_str()) && *name != REQUEST_ID_HEADER {
                 builder = builder.header(name.as_str(), value.as_bytes());
             }
         }
+        let request_id = self.request_id.clone();
+        if let Ok(value) = HeaderValue::from_str(&request_id) {
+            builder = builder.header(REQUEST_ID_HEADER, value);
+        }
         let (sender, receiver) = mpsc::channel(64);
         tokio::spawn(self.pump(sender, Some(response), None));
-        builder
-            .body(channel_body(receiver))
-            .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response())
+        builder.body(channel_body(receiver)).unwrap_or_else(|_| {
+            with_request_id(StatusCode::BAD_GATEWAY.into_response(), &request_id)
+        })
     }
 
     /// Answers a streaming request that is still waiting: commits to a 200
@@ -393,15 +411,23 @@ impl Session {
     /// and errors are reported in-band as `error` events, as llama.cpp
     /// reports mid-stream errors.
     fn commit_waiting(self, grant: oneshot::Receiver<Grant>) -> Response {
+        let request_id = self.request_id.clone();
         let (sender, receiver) = mpsc::channel(64);
         tokio::spawn(self.pump(sender, None, Some(grant)));
-        Response::builder()
+        let mut builder = Response::builder()
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, "text/event-stream")
             .header(header::CACHE_CONTROL, "no-cache")
-            .header("x-accel-buffering", "no")
-            .body(channel_body(receiver))
-            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+            .header("x-accel-buffering", "no");
+        if let Ok(value) = HeaderValue::from_str(&request_id) {
+            builder = builder.header(REQUEST_ID_HEADER, value);
+        }
+        builder.body(channel_body(receiver)).unwrap_or_else(|_| {
+            with_request_id(
+                StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+                &request_id,
+            )
+        })
     }
 
     /// Streams a committed response to its end: relays the server's events,
@@ -586,12 +612,18 @@ impl Session {
     fn refuse(mut self, rejection: &Rejection) -> Response {
         let (status, ..) = describe(rejection);
         self.close("refused", status.as_u16(), None);
-        refusal(rejection, self.config.queue.retry_after.0)
+        with_request_id(
+            refusal(rejection, self.config.queue.retry_after.0),
+            &self.request_id,
+        )
     }
 
     fn fail(mut self, status: StatusCode, message: &str) -> Response {
         self.close("error", status.as_u16(), None);
-        error(status, "server_error", message.to_owned())
+        with_request_id(
+            error(status, "server_error", message.to_owned()),
+            &self.request_id,
+        )
     }
 
     /// Ends the session: reports a completed request to the engine with

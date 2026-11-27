@@ -233,6 +233,7 @@ impl Gate {
             names,
             custom_identify,
             tickets: AtomicU64::new(0),
+            request_ids: AtomicU64::new(0),
             held: Arc::default(),
             source,
             reloading: tokio::sync::Mutex::new(()),
